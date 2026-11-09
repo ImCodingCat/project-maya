@@ -8,15 +8,23 @@ Written against v1.1.57 (`0065548`). Back to the [model's page](GLM53.md).
 
 **Read this first: nothing here was measured.** The review machine has no GPU and no copy of the model. Every
 expected gain is an estimate from the code, from the model's shapes, or from a measurement the project wrote down
-for another model or PC. Section 8 says how to check each one.
+for another model or PC. Section 9 is a runbook: the model that carries this report out runs each check there and
+decides from the result.
 
-**The three findings that shape everything else.**
+**The owner's decisions (2026-11-09).**
+
+1. **The targets** are PCs that run the model from VRAM + RAM, with the NVMe when needed, and the **Gorgon Halo**
+   (160 GB of GPU memory, 32 GB of RAM) running a GGUF of about 170 GB. Rigs that hold the whole model in VRAM are
+   not optimised at this stage; items that serve only them are marked "deferred".
+2. **Validation is not part of this report.** The steps are (section 9); whoever reads it runs them.
+3. **Turbo is wanted for GLM-5.3:** speed first, and coherent answers are the only requirement (section 5.7).
+
+**The five findings that shape everything else.**
 
 1. **A decoded token reads about 21 GB of weights, and two thirds of that is dense weights - mostly the
    attention's projections - not experts.** GLM-5.3 has a full attention on each of its 78 layers; Flash has one on
-   11 of 45. So GLM-5.3 is bound
-   by memory bandwidth and by how many experts sit in VRAM - and on a prompt, by how often the experts must be
-   streamed (once per chunk, about 10 s on one V100).
+   11 of 45. So GLM-5.3 is bound by memory bandwidth and by how many experts sit in VRAM - and on a prompt, by how
+   often the experts must be streamed (once per chunk, about 10 s on one V100).
 2. **Much of what would make it faster is already in the tree but off, gated to Flash's sizes, or not wired.**
    Context-cache streaming is implemented end to end and disabled by one product flag. Decode graphs, the
    tensor-core decode attention and native Q8_0 attention weights wait "until validated". Six pieces of the
@@ -24,30 +32,41 @@ for another model or PC. Section 8 says how to check each one.
 3. **Several defaults and one data file do not fit GLM-5.3.** The shipped expert profile ranks 8 of the last
    layer's experts among its first 4,800 places, where every other layer has 49 - 78; the tier's ageing, the split's
    chunk cap and the short-prompt threshold were measured on Flash.
+4. **Turbo's biggest lever already exists and was never measured.** One switch makes routing prefer experts that
+   are already in VRAM. Turned up, no expert is fetched at all - no CPU lane, no PCIe, no NVMe - and a RAM-bound PC
+   decodes like one that holds the model. The same idea in the prompt path would remove a chunk's fixed cost.
+5. **On the Gorgon Halo a 170 GB GGUF almost fits under Windows and fits completely under Linux** - by the
+   engine's own sizing rules; Linux was never run on that machine. Either way a token is bound by the memory's
+   bandwidth, about 11 tokens/s. The lever past that is one-GPU drafting, which is off for GLM-5.3 for a reason
+   that belonged to the 239 GB quant. And the GGUF itself matters: with IQ1_M experts the engine has no batched
+   prompt path at all (section 7.5).
 
-**The recommendations with the most value for the effort.**
+**The recommendations with the most value for the effort.** All effects are estimates.
 
-| | Recommendation | Expected effect (estimate) | Effort | Changes the answers? | See |
+| | Recommendation | Expected effect | Effort | Changes the answers? | See |
 | --- | --- | --- | --- | --- | --- |
-| **Decode** | | | | | |
+| **VRAM + RAM (+ NVMe), decode** | | | | | |
 | 1 | Turn on the cache streaming the engine already has | Frees 4.9 GiB of VRAM at a 128K context, 11 GiB at 256K: about 450 / 1,100 more experts resident, and larger prompt chunks | Validation, one flag | No | M1 |
-| 2 | Keep `attn_k_b` / `attn_v_b` in native Q8_0 | -1.1 GB of VRAM and -5% of the bytes every token reads | A parity run, a pack rebuild | Within rounding (closer to the GGUF) | M3 |
-| 3 | FP16 index keys by default | -9% cache; half the key bytes the indexer reads (saves 0.7 GB a token at 128K) | A flag, a KL check | Slightly | M2 |
-| 4 | Validate and enable decode graphs | About 1,500 kernel launches a token become one replay a GPU; Flash gained 8 - 9% from a smaller version | Validation | No | G1 |
-| 5 | Tensor cores for the decode attention | The attention is 11 G multiply-adds a token on CUDA cores; Flash's equivalent kernels gained about 4x | Settings first, then one kernel | Within rounding | G2 |
-| 6 | CPU lane: pick the kernel per expert type by timing, huge pages, per-class calibration | 10 - 30 ms a token on a RAM-bound PC | Small to medium | No | C1 - C3 |
-| 7 | Finish the speculative decode's wiring; measure acceptance; let the tuner choose "no drafting" | Removes cases where drafting is slower than not drafting (non-Latin answers on 3+ GPUs; RAM-bound splits) | Small | No | S1 - S3 |
-| 8 | Expert tiers: rebuild the profile, free unused spare slots, RAM-resident mode from the setup, GLM-5.3 constants | A few percent more experts in VRAM; no churn where RAM holds the model | Small | No | T1 - T5 |
-| 9 | A GLM-5.3 Turbo preset (skip the least important missing experts) | The largest single lever on a RAM-bound PC; Flash measured +7% to +62% | A KL sweep over 75 layers | **Yes** (opt-in) | A1 |
-| **Prefill** | | | | | |
-| 10 | On a split, pipeline reads that fit in one chunk | -10% to -18% on 4K - 16K reads (fit to the 3x V100 timings) | A setting to try today, then a small change | No | P1 |
-| 11 | Size the prompt's buffers for GLM-5.3's one residual stream, not Flash's four (and row 1) | About 25% more tokens a chunk on one GPU, each avoided chunk about 10 s; 1.2 GB of pinned RAM back per GPU of a split | Small, exact | No | P2 |
-| 12 | Start the CPU's share at the plan; hand the routes over before the shared expert | Seconds per long read where a second lane exists | Small | No | P3, P4 |
-| 13 | A faster prompt attention kernel, on every architecture | The attention is about 30% of a long read; the kernel reaches about 25 TFLOPS on a V100 (cuBLAS: 53), and Turing and non-RDNA AMD run F32 | A new kernel | Within rounding | K1 |
-| 14 | Continue from the decoded answer instead of reading it again | Agent turns read only the new tool result | Small to medium | No | R1 |
+| 2 | Keep `attn_k_b` / `attn_v_b` in native Q8_0 | -1.1 GB of VRAM and -5% of the bytes every token reads | A parity run, a pack rebuild | Within rounding | M3 |
+| 3 | Expert tiers: rebuild the profile, free unused spare slots, RAM-resident mode from the setup, stop sending evicted VRAM experts to disk, count usage in tokens | More experts in VRAM, fewer NVMe reads; no churn where RAM holds the model | Small | No | T1 - T5, D1, D2 |
+| 4 | CPU lane: pick the kernel per expert type by timing, huge pages, per-class calibration | 10 - 30 ms a token on a RAM-bound PC | Small to medium | No | C1 - C3 |
+| 5 | Finish the speculative decode's wiring; measure acceptance; let the tuner choose "no drafting" | Removes cases where drafting is slower than not drafting | Small | No | S1 - S3 |
+| 6 | FP16 index keys; decode graphs | -9% cache and half the key reads; 1,500 launches a token become one replay a GPU | Validation | Slightly; no | M2, G1 |
+| **VRAM + RAM (+ NVMe), prompts** | | | | | |
+| 7 | On a split, pipeline reads that fit in one chunk | -10% to -18% on 4K - 16K reads (fit to the 3x V100 timings) | A setting to try, then a small change | No | P1 |
+| 8 | Size the prompt's buffers for GLM-5.3's one residual stream, not Flash's four | About 25% more tokens a chunk on one GPU, each avoided chunk about 10 s; 1.2 GB of pinned RAM back per GPU of a split | Small, exact | No | P2 |
+| 9 | Start the CPU's share at the plan; hand the routes over before the shared expert; continue from the decoded answer | Seconds per long read; agent turns read only the new tool result | Small | No | P3, P4, R1 |
+| **Turbo** | | | | | |
+| 10 | Sweep the route bias (`MAYA_GLM_ROUTE_AFFINITY`) against the coherence gate | No expert fetched: roughly 3 - 5x decode on a RAM- or disk-bound PC | A sweep, no code | **Yes** | A1, 9.6 |
+| 11 | The same bias and skips in the prompt path | A chunk stops streaming experts: its fixed cost (about 10 s on one V100) goes | Small code | **Yes** | A2 |
+| 12 | Fewer experts a token (`RESIDENT_TOPK`), per layer; lenient draft acceptance; a smaller dense quant | Fewer bytes a token everywhere; fewer redone drafts on a split | Sweep, then small code | **Yes** | A1, A2 |
+| **Gorgon Halo** | | | | | |
+| 13 | Run it on Linux with a small carve-out - or tighten the fit on Windows | Every expert resident on Linux; on Windows 3 - 7% stay outside GPU memory | A measurement | No | H1, H3 |
+| 14 | Switch on one-GPU drafting for GLM-5.3 once the model fits | 1.2 - 1.4x decode as is, up to about 1.6x with two small code changes | A setting, then small code | No | H2 |
+| 15 | In the GGUF: no IQ1_M experts; the dense types the kernels serve best | A prompt path at all; each GB of dense weights is about 4.3 ms a token | The quant's design | - | 7.5 |
+| 16 | Prompts: a hipBLASLt table for the installed version; the fused AMD expert kernel at this model's shape | Flash precedents: 128 -> 168 and 233 -> 271 tokens/s | Small; medium | Within rounding | H5 |
 
-**Where to start** depends on the PC (section 7.4): on the usual RAM-bound PC, rows 1 - 3, 6 and 8 come first; on a
-PC that holds the model in VRAM, rows 4 and 5.
+**Where to start:** section 8 has the order, section 8.6 by kind of PC, section 9 the procedures.
 
 **One caveat.** The project's own long-context quality gate does not pass on this model yet at 32K (section 3.4).
 Settle that before spending effort on long-context speed: the fix may change what the indexer costs.
@@ -62,7 +81,10 @@ and `.cuh`, the GLM-5.3 parts of `glm_fast.cu`), the expert tiers and the CPU la
 `glm_dsa_prompt_plan.cpp`, `glm_dsa_prefill_stream*.cpp`, `src/prefill/*`), the state / cache / split code
 (`glm_state_layout.cpp`, `glm_model.cu`, `glm_dsa_split.cpp`, `src/kernels/cuda/glm_kv_stream.cu`), the pack tools
 (`tools/iq_pack.py`, `tools/strata/glm_dsa_pack.py`) and what the setup writes for it (`maya.py`,
-`serve/glm_dsa_product.py`, `serve/glm_dsa_tune.py`).
+`serve/glm_dsa_product.py`, `serve/glm_dsa_tune.py`). For the later sections: the unified-memory and Windows APU
+handling (`include/strata/platform/*.hpp`, `docs/AMD_MAYA.md`), the disk reads, Turbo's product side
+(`serve/models.py`), and the repository's own test and bench tools (`tools/strata/glm53_gpu_checks.sh`,
+`bench_http.py`, `tools/maya_quant/loop_test.py`).
 
 **What was not done.** Nothing was run. The review machine has no GPU and no copy of the 239 GB model, so there is
 **no new measurement in this report** (the one file that was processed is the shipped expert profile, T1). The
@@ -75,7 +97,7 @@ they cite. Every number is one of three kinds, and each is labelled:
 | **[project]** | A measurement the project itself wrote down (a code comment, `docs/SETTINGS.md`, the changelog). Quoted, not re-measured. Most are for GLM-5.3-Flash or for a 3x V100 PC, and are named as such. |
 | **[estimate]** | My arithmetic from the model's shapes and the pack's tensor types. Expect ±20%. |
 
-A recommendation's *expected effect* is therefore a reasoned estimate, never a promise. Section 8 says how to measure
+A recommendation's *expected effect* is therefore a reasoned estimate, never a promise. Section 9 says how to measure
 each one with the tools the repository already has.
 
 **Four kinds of PC.** Which recommendation matters depends on where a token's time goes, so the report keeps
@@ -215,7 +237,7 @@ these gaps. Everything in it is **[code]**.
 | A helper GPU for experts | Refuses `n_embd > 4096` | `glm_fast_path.cu:2249` | T8 |
 | The waiting GPU helping a one-chunk prompt | EXL3 only, or NVLink only, and two GPUs only | `glm_prefill.cu:2842`, `:4673-4676` | P1, P6 |
 | Tier constants, the split's chunk cap, the token-path threshold, the expert profile | Flash's values or Flash-era data | T1, T5, P1, P6 | T1, T5, P1 |
-| Setup: per-PC tuning | `--calibrate` sweeps three knobs; the setup writes no GLM-5.3 switch on NVIDIA | `tools/calibrate_glm.py:84-88`, `maya.py:3495-3502` | 7.1 |
+| Setup: per-PC tuning | `--calibrate` sweeps three knobs; the setup writes no GLM-5.3 switch on NVIDIA | `tools/calibrate_glm.py:84-88`, `maya.py:3495-3502` | 8.1 |
 
 Two of these are bigger than they look. The decode attention runs on 79 layers a token here, against 11 on Flash,
 so its kernel choice matters seven times as much. And the context cache is five times Flash's per token, so cache
@@ -354,7 +376,7 @@ freed VRAM holds, so it is largest where the CPU lane runs many experts".
 
 **Expect [estimate].** GLM-5.3's `attn_q_b` is Q8_0 on all 78 layers: 2.78 GB. At Q5_K it is 1.80 GB - about 1 GB of
 VRAM and of per-token reads. Taking `attn_output` from Q5_K to Q4_K would save another 0.98 GB. Unlike M1-M3 this
-changes the model's output, so it belongs with the opt-in approximations (section 5.6) and needs its own KL table
+changes the model's output, so it belongs with Turbo (section 5.7) and needs its own check
 before anyone is pointed at it.
 
 ### 5.2 The GPU path: fewer launches, tensor cores for the attention
@@ -427,8 +449,9 @@ tensor cores were worth about 4x: "RTX 5060 Ti 49 -> 11 us a token and DSA layer
 4. *AMD, new kernel:* the prompt path already has an RDNA matrix-core attention for GLM-5.3 (`mla_prompt_rdna`,
    `src/core/glm_prefill_dsa.cu:573-578`); a decode version of it is the AMD counterpart of step 3.
 
-**Expect [estimate].** On a VRAM-rich NVIDIA PC, a few milliseconds a token (the attention is 11 G multiply-adds
-a token). On a RAM-bound PC it is hidden behind the misses - do M1-M3 and the C-group first there.
+**Expect [estimate].** Where the GPUs set the pace, a few milliseconds a token (the attention is 11 G multiply-adds
+a token). On a RAM-bound PC it is hidden behind the misses - do M1-M3 and the C-group first there - until Turbo
+removes the misses (section 5.7): then this is what a token's time is made of.
 
 #### G3. The indexer's scorer below 16K cells, and on AMD
 
@@ -596,7 +619,7 @@ runs on GLM-5.3, but row by row where it could share. **[code]**
   (`src/core/glm_mtp.cu:422-427`): only the projections and `dsa_prep` are needed there.
 
 **Expect.** Nothing by default (no default mode uses a window on GLM-5.3). It decides whether the one-GPU drafting
-can pay - on the Gorgon Halo an estimated 1.4 - 1.7x (section 7) - and S6 after it.
+can pay - on the Gorgon Halo an estimated 1.2 - 1.6x (section 7.4, H2) - and S6 after it.
 
 #### S6. A deeper pipeline for 3+ GPUs: make the pipelined window work on GLM-5.3
 
@@ -903,7 +926,98 @@ VRAM-rich token **[estimate]**.
 - **Undocumented switches** that shape GLM-5.3's tiers: `STRATA_GLM_RAM_EVICT`, `_RAM_PROTECT`, `_RAM_FREE`,
   `_TIER_GC`, `_AHEAD` / `_AHEAD_READ`. Document or remove them.
 
-### 5.6 Turbo: the fastest GLM-5.3 that still answers coherently
+### 5.6 The NVMe tier (PCs whose VRAM and RAM do not hold the model)
+
+**What a disk read is [code].** A routed expert that is in neither VRAM nor the RAM tier parks the GPU
+(`moe_wait`) while the host reads it:
+
+- An expert is not one piece on disk. A layer is three tensors of 256 experts, so its gate, up and down parts lie at
+  three file positions (`native_experts.txt` gives a layer's three offsets, `src/core/glm_model.cu:3036-3052`).
+- Each part is read in 8 chunks: 24 reads an expert, on 8 worker threads plus the service thread
+  (`src/core/glm_fast_path.cu:2112-2113`, `:5104-5111`, `:5161-5163`).
+- Linux reads with `O_DIRECT` into a per-thread bounce buffer and then copies (`glm_fast_path.cu:691-724`); a
+  refused `O_DIRECT` silently becomes a buffered read (`:725-733`). Windows uses an unbuffered overlapped handle.
+- The bytes land in a free RAM slot, else in pinned staging, and the GPU pulls each chunk as it lands
+  (`:5088-5102`, `:5122-5172`).
+
+**What it costs.** For Flash-size experts the project measured "3.6 -> 3.1 ms a disk wait" on NVMe
+(`glm_fast_path.cu:5104-5106`), and on a SATA SSD "~13 reads, 155 of 190 ms" of a token (`:2116-2117`)
+**[project]**. GLM-5.3's experts are larger: about 4 - 5.5 ms each at 2 - 3 GB/s **[estimate]**. How many a token:
+with the engine's own coverage rule (`1 - (1 - f)^3`, `glm_model.cu:1730-1737`), holding 80% of the experts in VRAM
+and RAM gives about 5 reads a token, 70% about 16, 60% about 38 **[estimate]**. At 70% that is 70 ms of every token
+spent waiting for the SSD. So the first rule on such a PC is section 5.1: every GB freed in VRAM or RAM is a GB not
+read from disk. The rest of this section is what remains.
+
+#### D1. Do not send an evicted VRAM expert to disk while the RAM tier holds colder ones
+
+**Evidence [code].** When a spare slot must be refilled, the layer's least recently used resident leaves VRAM. It
+goes to a free RAM slot if there is one. If there is none, it should replace the RAM tier's coldest expert when it
+is hotter - but under the default recency rule its count is taken as zero (`const uint32_t c = vram_lru ? 0u : ..`,
+`glm_fast_path.cu:5728`), so the test `rc_min < bc` (`:5762`) can never pass, and the expert is dropped to disk
+(`:5783-5791`). Only four RAM slots a class are kept free (`:5797-5798`).
+
+**Consequence [estimate].** On a disk-bound PC, every promotion beyond those four a token turns an expert that was
+used recently enough to be in VRAM into a future disk read, while colder experts keep their RAM slots.
+
+**Do.** Under the recency rule compare by last use (the tick both tiers already keep), or simply swap with the RAM
+tier's victim. **Try first, no code:** `MAYA_GLM_VRAM_EVICT=least` (the count rule) and `MAYA_GLM_RAM_FREE=32`.
+**Measure:** `STRATA_GLM_TIER_DIAG=1` (`glm_fast_path.cu:5995`) prints the disk reads of experts that were dropped
+from VRAM; the `glm stat` line gives reads a token (`src/program/generate.cpp:2487`).
+
+#### D2. Keep the usage counts through a prompt, and start them from the profile
+
+**Evidence [code].** A prompt's routes are added to the same counts the decode evicts by, and the counts halve
+every 32,768 routed experts (`src/core/glm_prefill.cu:3034-3051`). One 12,288-token chunk is 98,304 routes a layer:
+three halvings a layer, 225 over the chunk. After a long prompt the counts of all but the last layers are zero, so
+the "least used" rule has nothing to go by. At a fresh start the counts are zero too.
+
+**Do.** Halve by tokens, not by routed experts (T5), and add a chunk's routes at a token's scale. Seed the counts
+from the expert profile's rank at start, or have the setup switch on the usage file that keeps them between starts
+(`MAYA_GLM_USAGE`, off, `docs/SETTINGS.md:100`).
+
+#### D3. Read an expert as one aligned piece
+
+**Evidence [code].** 24 reads and a copy an expert (above). The pack tool can write one contiguous
+`[gate|up|down]` blob an expert (`--experts-bin`, `tools/strata/glm_dsa_pack.py:398-408`), but the GLM engine reads
+that file's offsets and never uses them (`glm_model.cu:3039-3040`: `off` and `blob` are parsed and dropped).
+
+**Do.** Read the blob - 4 KiB-aligned for this model's expert sizes - straight into the pinned slot with direct IO:
+one to eight reads, no bounce copy. It costs the experts' size again on disk. **Try first, no code:** fewer, larger
+pieces per request - `bench_http.py --tune '{"read_chunks": 4}'`, then 2 and 1 (the calibration tries only 4 and
+2). A DRAM-less NVMe read "1.6 GB/s in the 256 KB pieces ... and 3.0 GB/s in 2 MB ones" (`glm_prefill.cu:2261-2263`)
+**[project]**.
+
+#### D4. Use the time a disk read takes
+
+- **The CPU lane waits for the disk.** A route's CPU-lane experts start only after its disk reads return
+  (`glm_fast_path.cu:5161-5172`, then `:5214`). Start them first: the route then costs the longer of the two, not
+  the sum.
+- **Lookahead** (`MAYA_GLM_AHEAD=<n>`, off): the next n layers' routers run on this layer's input and their
+  disk-only experts are read ahead. On Flash it was "NOT faster ... only ~40% of disk misses are predictable within
+  4 layers" (`bench/results/2026-10-06-glm-spec/README.md:31-33`) **[project]**. GLM-5.3 has an attention between
+  every two MoE layers where Flash has one in four, so a read has longer to land: A/B it again, with
+  `MAYA_GLM_AHEAD_READ=0` first to see the predictions' coverage without the reads.
+- **After a prompt**, read back in the background what the prompt's lending pushed out of VRAM and RAM
+  (`glm_prefill.cu:1776-1832`), instead of on the first tokens that route to it.
+
+#### D5. Smaller disk items
+
+- **Load order.** GLM-5.3 warms its tiers on one thread in file order (`MAYA_GLM_WARM_SEQ`, on for this model
+  only), a rule made for a hard disk: "the test PC's USB disk gave 39 MB/s, 201 GB in 89 min"
+  (`include/strata/core/glm_warm_seq.hpp:7-8`). On an NVMe the parallel order (24 slices on 8 threads) should load
+  faster; Flash's Maya-L warmed 134 GB in 44 s that way (`docs/AMD_MAYA.md:288`) **[project]**. The setup already
+  tells a spinning disk from an SSD (`maya.py:855`): let it write `MAYA_GLM_WARM_SEQ=0` for an SSD.
+- **Say when direct IO was refused.** The fallback to buffered reads is silent (`glm_fast_path.cu:725-733`); with
+  it a 239 GB model also fills the page cache.
+- **Queue depth.** Decode has at most nine reads in flight a GPU, with no setting. The shards sit in one folder, so
+  a second SSD helps only as an OS-level stripe.
+- **In a prompt**, a chunk's disk experts are read, copied to the GPU and freed - so every chunk reads its whole
+  disk set again (`glm_prefill.cu:3736-3754`). A fifth of the model at 2.9 GB/s is 15 s a chunk **[estimate]**.
+  P5 (one expert pass a prompt) matters most here. `MAYA_GLM_DISK_READERS=8` measured +50% and +25% on one SSD and
+  -15% on another (`docs/SETTINGS.md:151`): the runbook sweeps it with `MAYA_GLM_DISK_QD`.
+- **The lossy way out** is `MAYA_GLM_DISK_SKIP_W` and route affinity: section 5.7.
+
+### 5.7 Turbo: the fastest GLM-5.3 that still answers coherently
 
 **The owner's decision (2026-11-09).** GLM-5.3 gets a Turbo mode. In Turbo, speed comes first: quality may drop, and
 the only thing that must hold is that answers stay **coherent**. KL against the exact model is recorded for
@@ -924,7 +1038,7 @@ Flash numbers, which are the only ones there are.
 | `MAYA_GLM_MISS_SKIP_W`, `_FROM` | Leaves out an expert that is not in VRAM and carries less than this share of the route's weight, on layers from `_FROM` on. Also a per-request knob (`"strata_tune": {"miss_skip_w": ..}`) | 27.4 -> 30.9 tok/s at 0.16 (KL 0.075), `docs/SETTINGS.md:135` | RAM-bound |
 | `MAYA_GLM_TRUNK_KEEP`, `_MAP` | Leaves out experts missing from VRAM from route rank n on; `_MAP` is a digit per layer | +23% and +25% with a per-layer map (KL 0.018), `docs/SETTINGS.md:133` | RAM-bound |
 | `MAYA_GLM_DISK_SKIP_W`, `_FROM` | Never waits for the SSD for a light or low-ranked expert | 13.3 -> 21.6 tok/s at 0.12 (KL 0.12), `docs/SETTINGS.md:134` | Disk-bound |
-| `MAYA_GLM_RESIDENT_TOPK=<k>`, `MAYA_GLM_RESIDENT_SKIP_W` | Computes only the k heaviest routed experts, **wherever they sit**; the kept weights are renormalised (`glm_fast.cu:4206-4225`) | Strix Halo, all experts in VRAM: 33.2 -> 38.8 tok/s at k = 4; k = 3 broke the output; `_SKIP_W=0.20` "garbage", `docs/SETTINGS.md:136` | **Gorgon Halo**, and everything else |
+| `MAYA_GLM_RESIDENT_TOPK=<k>`, `MAYA_GLM_RESIDENT_SKIP_W` | Computes only the k heaviest routed experts, **wherever they sit**; the kept weights are renormalised (`glm_fast.cu:4206-4225`) | Strix Halo, all experts in VRAM: 33.2 -> 38.8 tok/s at k = 4; k = 3 broke the output; `_SKIP_W=0.20` "garbage", `docs/SETTINGS.md:136`. On Flash's 1 - 2 bit quants k = 4 "rambled" and Turbo leaves the cap off (`serve/models.py:796-798`) | **Gorgon Halo**, and everything else |
 | `MAYA_GLM_MTP_KEEP=0` | The draft block never fetches a missing expert | default 2 (`glm_fast_path.cu:6134-6145`) | splits |
 | Greedy decoding, thinking off or at its lowest level | Request level: fewer tokens, and more drafts accepted | part of Flash's Turbo | all |
 
@@ -978,7 +1092,7 @@ Two things follow from it:
 | PC | Start the sweep from | Then add |
 | --- | --- | --- |
 | VRAM + RAM (+ NVMe) | `MAYA_GLM_ROUTE_AFFINITY=2`, greedy, lowest thinking level, `MAYA_GLM_MTP_KEEP=0` | `MAYA_GLM_RESIDENT_TOPK` 6 -> 5 -> 4; if the bonus must come down for coherence: `MAYA_GLM_MISS_SKIP_W` and `MAYA_GLM_DISK_SKIP_W` for what still misses |
-| Gorgon Halo, most experts in VRAM | `MAYA_GLM_RESIDENT_TOPK=4` (Flash's value there), greedy, lowest thinking level | `MAYA_GLM_ROUTE_AFFINITY` for the experts that do not fit; A2.5 once it exists |
+| Gorgon Halo, most experts in VRAM | `MAYA_GLM_RESIDENT_TOPK` 6, then 5, then 4; greedy, lowest thinking level | `MAYA_GLM_ROUTE_AFFINITY` for the experts that do not fit; A2.5 once it exists |
 
 Section 9.6 turns this into a sweep with a pass / fail rule, and says where the winning values go in
 `serve/models.py`.
@@ -1225,7 +1339,8 @@ Only worth the work for contexts above about 64K; remember section 3.4 first.
 - **AMD.** The fused expert kernel requires `n_embd == 4096` (`glm_prefill.cu:313-316`): GLM-5.3 runs MMQ on every
   Radeon.
 - **IQ1_M** experts have no MMQ kernel, so a pack that uses them reads its whole prompt token by token
-  (`glm_prefill.cu:1102-1116`). Not UD-IQ2_M, but it rules out the smallest quants.
+  (`glm_prefill.cu:1102-1116`). Not UD-IQ2_M - but a 170 GB quant is exactly where IQ1_M would be chosen
+  (section 7.5).
 
 #### K6. Small kernel-side items
 
@@ -1276,110 +1391,693 @@ least a chunk's fixed cost (2 - 10 s), so measure the common-prefix length on re
   quality; it is also most of the wall time of a short answer. Nothing to change in the engine - but any user-facing
   speed comparison should say which level it used.
 
-## 7. Suggested order of work
+## 7. The Gorgon Halo: 160 GB of GPU memory, 32 GB of RAM, a GGUF of about 170 GB
 
-### 7.1 First: settings and data (measure, then flip - no new code)
+A target of its own (the owner's decision). The project has run GLM engines on exactly this machine - "Ryzen AI Max+
+PRO 495 / Radeon 8065S (Gorgon Halo, 192 GB LPDDR5X, 160 GB of it the GPU's), Windows 11"
+(`docs/AMD_MAYA.md:284-288`) - but only GLM-5.3's 239 GB quant, which does not fit it, was tried there
+(`src/core/glm_mtp.cu:25-28`). A 170 GB GGUF changes the picture: almost all of it fits.
 
-One GPU session with the model covers most of these. Each needs its check from section 8 and nothing else.
+### 7.1 What the engine does on this machine today
 
-| # | Do | Who gains | See |
-| ---: | --- | --- | --- |
-| 1 | Validate the cache streaming the engine already has; set the product flag | 64K contexts and up; long prompts on one card | M1 |
-| 2 | Run the parity check of native Q8_0 `attn_k_b` / `attn_v_b`; rebuild the pack with it | everyone (1.1 GB) | M3 |
-| 3 | KL-check FP16 index keys; make them the default layout | long contexts | M2 |
-| 4 | Validate the decode graphs; turn them on | everyone, most on VRAM-rich PCs | G1 |
-| 5 | Rebuild the shipped expert profile from decode counts on a split | everyone | T1 |
-| 6 | A/B `MAYA_GLM_PREFILL_MIN_CHUNKS=3,2048` | every split | P1 |
-| 7 | Time the decode attention: `STRATA_GLMD_MLA_DEC=1` on the other Radeons, `STRATA_GLMD_FUSED_MLA=1` on each NVIDIA generation | VRAM-rich, AMD | G2 |
-| 8 | Time the CPU lane's kernels per expert type (`glm_cpu_bench --row4 both`); try `MAYA_GLM_LANE_ROW4=1`, and `MAYA_GLM_CPU_SHARED=1` on two GPUs | RAM-bound | C1, C4 |
-| 9 | Measure draft acceptance at the default sampling; A/B drafting off (`MAYA_GLM_NO_SPEC=1`) and `MAYA_GLM_SPEC_SAMPLE=1` | every split | S2, S3 |
-| 10 | A/B `--glm-ram-resident` with `MAYA_GLM_PROMOTE_MIN` where RAM holds all off-card experts; `MAYA_GLM_RESIDENT_SKIP=1` where VRAM holds them all | 256 GB RAM PCs; VRAM-rich NVIDIA | T3, T4 |
-| 11 | Turn on `MAYA_GLM_WARM_PROMPT`; A/B `MAYA_GLM_PREFILL_CPU_GATE=0`; on Turing `STRATA_GLMD_GATHER_RATIO=1` | first prompt; PCIe 4 / 5 PCs; Turing | P6, K1 |
+**On Windows** the GPU's memory is a fixed carve-out, and the engine sizes it like a discrete card
+(`src/core/glm_fast_path.cu:812-822`) **[code]**:
 
-Then let the setup write what won, per PC, and let `--calibrate` sweep the per-request knobs it does not touch
-today (`lane_row4`, `cpu_split`, `promote_min`, `mtp_keep`, `pcie_frac_head`, `graphs` - all listed in
-`serve/glm_dsa_tune.py:9-34`; the tool sweeps three, `tools/calibrate_glm.py:84-86`).
+- **The expert pool** is what HIP reports free, less a 3,072 MiB reserve the setup writes (`maya.py:973-979`),
+  kept inside the dedicated memory and inside Windows' commit (`glm_fast_path.cu:6930-6988`). HIP reports about
+  172 GB for a 160 GB carve-out, and whatever is put past the carve-out pages: "8K-token prompts ran at 62 instead of
+  159 tok/s" (`include/strata/platform/dedicated.hpp:3-7`) **[project]**. The page file must be about the GPU's share
+  plus 8 GB; the setup asks for 180 GB (`docs/AMD_MAYA.md:268-281`).
+- **The RAM tier** is pinned memory, which Windows counts as *shared GPU memory* and caps for all programs together:
+  "160 GB carve-out, 15.84 GB shared, 2.56 GB of it held by the desktop: 13.02 GB of pinned buffers ran and 14.02 GB
+  failed" (`include/strata/platform/gpu_shared.hpp:10-12`) **[project]**. The engine keeps GLM-5.3's tier under that
+  limit (`glm_fast_path.cu:1840-1857`); with the setup's 8 GB headroom it is "a 10.4 GB tier instead of ~3 GB,
+  decode +10%" (`maya.py:3526-3532`) **[project]**.
+- **Everything else** is read from the NVMe when a token routes to it (section 5.6).
 
-### 7.2 Then: small, exact code changes
+**On Linux** an integrated GPU's memory is the system's (`glm_fast_path.cu:812-822`). The pool is
+`min(the experts' bytes, MemAvailable - 16 GiB - 1 GiB)`, measured after the dense weights and the cache are
+allocated (`glm_fast_path.cu:1349-1379`, `docs/AMD_MAYA.md:187-198`). When every expert fits, the warm-up fills every
+slot, no spare slots are kept, and the RAM tier is only a small staging floor. The project verified this path on a
+128 GB Strix Halo, not on the Gorgon Halo.
 
-Each is days, not weeks, and none changes the model's output.
+**On both:** the newer decode attention is on (gfx1151 is the one AMD device that gets it,
+`src/kernels/cuda/glmd_dec.cu:265-279`); the all-resident launch skip is on by default but acts only while *every*
+expert is in GPU memory (`src/core/glm_fast_state.hpp:588-624`); drafting on one GPU is off for GLM-5.3
+(`glm_mtp.cu:85-102`); `--calibrate` refuses a HIP build (`maya.py:3956-3958`), so nothing is tuned per machine.
 
-1. **P2** - the prompt's residual and hand-over buffers at GLM-5.3's real size (a quarter); the window floor.
-2. **S1** - the six unwired pieces of the speculative decode, starting with the statistics and the whole-head
-   fallback.
-3. **C1, C2, C3** - choose the CPU kernel per expert type by timing; huge pages on one-socket PCs; calibrate per
-   expert class.
-4. **T2, T4 (graph key), T5, T6 (router first)** - the tier's spares, the missing graph-key field, the constants.
-5. **P3, P4** - start the prompt's CPU share at the plan; hand the routes over before the shared expert.
-6. **G4** - the tiled multi-column GEMV for Q5_K (needed before any multi-token pass pays).
-7. **K2, K3, K6** - the copies, checks and repeated dequantization around the prompt attention.
-8. **R1, R2** - continue from the decoded answer; the reuse corner cases.
+### 7.2 Does a 170 GB GGUF fit?
 
-### 7.3 Then: the larger pieces
+**[estimate]** for a file with 19,200 trunk experts of 8.0 MB (153.6 GB), 15.6 GB of dense weights as in UD-IQ2_M,
+and a cache of 63,168 bytes a token (the NextN block's share is carved only when the block is loaded,
+`src/core/glm_state_layout.cpp:217`):
+
+| | Context | Room for experts | Experts outside GPU memory | Where they are |
+| --- | ---: | ---: | ---: | --- |
+| Windows, 160 GB carve-out | 32K | ≈ 150 GB | ≈ 650 of 19,200 (430 that do not fit + 225 spare slots kept empty) | all in the RAM tier (it holds ≈ 1,300) |
+| Windows, 160 GB carve-out | 128K | ≈ 144 GB | ≈ 1,450 | RAM tier full, ≈ 150 on the NVMe |
+| Linux, small carve-out | 32K | ≈ 166 GB | none | - |
+| Linux, small carve-out | 128K | ≈ 160 GB | none (with ≈ 4 GB to spare) | - |
+
+So the model runs on this machine either way. On Windows it is *almost* resident, and "almost" has three costs:
+
+1. Every MoE layer of every token still launches the wait, the fetch and the CPU-lane wait, because not *every*
+   expert is in GPU memory. On Flash's 42 layers that was "~2.5 ms of a 54 ms ... token on the 8065S"
+   (`glm_fast_path.cu:6284-6285`) **[project]**; on 75 layers about 4.5 ms a token **[estimate]**.
+2. A long prompt lends about 6 GB of the pool (`MAYA_GLM_PREFILL_MB=6144`), which displaces roughly 800 experts
+   into a RAM tier that is already nearly full **[estimate]**; the overflow goes to the NVMe and comes back on the
+   first tokens of the answer.
+3. Any growth - a longer context, loading the NextN block (about 3 GB) - pushes experts to the NVMe.
+
+### 7.3 What bounds its speed
+
+A token reads about 20 GB (14.9 GB of dense weights, the head, 600 experts of 8 MB). The project measured this
+GPU's GEMVs at "220-240 GB/s", bound by the LPDDR5X (`src/kernels/cuda/glmd_mv_ext.cuh:375-376`) **[project]**. So
+a token takes 85 - 93 ms - **about 11 tokens/s - with every expert resident and every kernel perfect [estimate]**.
+Three quarters of those bytes are dense weights. On this machine the levers are therefore, in order: read the dense
+weights once for several tokens (H2), read fewer bytes (H3, section 7.5), and only then anything else.
+
+### 7.4 Recommendations for this machine
+
+#### H1. Choose the operating system and the memory split on purpose
+
+**Evidence.** Section 7.2. On Linux with a small carve-out the whole 170 GB model is resident **[estimate]**: no
+RAM tier, no NVMe reads, no empty spare slots, no page-file rule, and the launch skip acts. On Windows it is 3 - 7%
+short.
+
+**Do.**
+- Measure the model on Linux on this machine (runbook 9.8). This is the largest step that needs no code.
+- **A pitfall to avoid:** Linux sizes the pool from the RAM the OS sees. With the BIOS still set to a 160 GB
+  carve-out it would see 32 GB and size a pool of about 11 GB **[estimate from `glm_fast_path.cu:1349-1379`]**. On
+  Linux the carve-out must be small. Have the setup warn when an integrated GPU's carve-out is larger than the RAM
+  left.
+- On Windows keep the 180 GB page file, and treat the 3 GiB reserve as measured: lowering it to 2 GiB buys 134
+  experts and risks the paging above.
+
+#### H2. Turn on one-GPU drafting for GLM-5.3 here (the verify window)
+
+**What.** `MAYA_GLM_MTP_DECODE=1`: the NextN block drafts up to three tokens and one batched pass checks them. The
+rows of that pass share the dense GEMVs, which is the only way past section 7.3's floor without changing the
+output.
+
+**Evidence.** It is the default on these APUs for Flash, where it gave "28.4-29.6 tokens/s instead of 19.7" on
+this very machine (`CHANGELOG.md:1364-1367`) **[project]**. It is off for GLM-5.3 for a reason that belongs to the
+239 GB quant: "a 4-row round read 5x a token's experts from the disk and the decode ran at x0.62"
+(`glm_mtp.cu:25-28`) **[project]**. With nearly every expert resident that reason is gone. The round length adapts
+by measurement and can fall to zero (`glm_mtp.cu:17-20`), so switching it on cannot make a token much slower.
+
+**Expect [estimate].** Token by token, each token reads 20.2 GB. In a window the rows share 12.6 GB of dense
+weights, and each row adds 7.6 GB of its own: its experts (4.8), the head (0.5) and 2.3 GB of `attn_k_b` /
+`attn_v_b`, which the window reads once per row (`src/core/glm_dsa_mixer.hpp:421-507`). A draft costs about 0.65 GB.
+
+| Round | Bytes read | Tokens kept at 75% / 85% acceptance | GB a token | Against 20.2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 draft, 2 rows | 28.5 GB | 1.75 / 1.85 | 16.3 / 15.4 | 1.24x / 1.31x |
+| 3 drafts, 4 rows | 45.0 GB | 2.73 / 3.19 | 16.5 / 14.1 | 1.23x / 1.43x |
+| 3 drafts, with `attn_k_b` / `attn_v_b` read once a window (S5) and in Q8_0 (M3) | 37.1 GB | 2.73 / 3.19 | 13.6 / 11.6 | 1.40x / 1.64x (against 19.1) |
+
+75% is the acceptance the code assumes before it has measured (`glm_mtp.cu:535`); nobody has measured GLM-5.3's.
+The NextN block costs about 3 GB of GPU memory (≈ 400 experts), which on Windows comes out of the pool.
+
+**Do.**
+1. A/B the switch as it is (runbook 9.8).
+2. S5's two code items: the headwise GEMVs once for all rows of a window; the tiled multi-column GEMV for Q5_K (G4).
+   On AMD the window already runs its rows a layer at a time (`src/core/glm_residual.cu:263-277`).
+3. Then make it GLM-5.3's default wherever nearly all routed experts are resident - a rule on the measured hit
+   rate, not on the device name - as it is Flash's default on these APUs today.
+
+#### H3. On Windows, shrink what is outside GPU memory
+
+Each expert is 8 MB. **[estimate]**
+
+| Change | Experts gained | See |
+| --- | ---: | --- |
+| `attn_k_b` / `attn_v_b` in native Q8_0 | +134 (and 1.1 GB fewer bytes every token) | M3 |
+| Do not keep empty spare slots where no route uses them | +150 - 225 | T2 |
+| FP16 index keys | +22 at 32K, +88 at 128K | M2 |
+| A context no larger than needed | +126 for every 16K less | - |
+| The NextN block only if H2 pays | +400 when it is not loaded | H2 |
+
+Cache streaming (M1) is *not* on this list: the streamed rows would live in pinned RAM, which is the scarcer of the
+two pools here. `--glm-ram-resident` is a useful check, though: it refuses to start unless RAM holds every expert
+that GPU memory does not, so a start with it proves that nothing is left on the NVMe.
+
+#### H4. Skip the empty launches layer by layer
+
+**Evidence [code].** The launch skip is all or nothing (`glm_fast_state.hpp:600-624`). A per-layer version exists
+(`layer_res`, "every expert of layer il in VRAM"), but only batched rows use it (`glm_fast_state.hpp:595-599`,
+`glm_fast_path.cu:6289-6292`), together with a fused wait + fetch launch for the other layers.
+
+**Do.** On the token path use the fused launch (T4, step 3) and fold the CPU-lane wait into it: one launch a layer
+instead of three, about 3 of the 4.5 ms a token **[estimate]**. The per-layer skip itself helps only on layers that
+are complete. With the shortfall spread evenly over the layers none is - and spreading it is right, because it
+leaves out each layer's coldest experts.
+
+#### H5. Prompts on this machine
+
+- **Check the pack's expert types first** (section 7.5). A pack with IQ1_M experts has no prompt path at all.
+- **hipBLASLt table.** The projections take hipBLASLt only when a tuning table matches the installed version
+  *exactly* (`src/prefill/hipblaslt_tuning.hpp:55-58`). GLM-5.3 has one table, for one version
+  (`tools/hip/gfx1151-glm53-hipblaslt-100202.txt`); Flash has tables for 100202, 100401 and 100500. On any other
+  version GLM-5.3's projections fall back to plain hipBLAS. On Flash, four tuned rows "took a prompt from 128 to
+  168 tok/s" (`docs/AMD_MAYA.md:312`) **[project]**. Generate the table for the installed version
+  (`tools/hip/tune_hipblaslt.cpp`, `--shape T,N,K`; the engine's log names each shape that misses).
+- **The sub-batch.** The setup writes `MAYA_GLM_PREFILL_SUB=1024` for every AMD GPU - a value chosen for Flash,
+  whose own default was 256. It also overrides GLM-5.3's attention sub-batch, which is 2,048 by itself
+  (`src/core/glm_prefill.cu:362-364`). A/B 2048.
+- **The fused expert kernel.** On Flash it gave, with the attention change, "271 and 278 tokens/s instead of 233
+  and 253" on this GPU (`CHANGELOG.md:1376-1379`) **[project]**. It is instantiated for 4096 x 2048 and for
+  DeepSeek's 5120 x 2304 only and aborts on anything else (`src/prefill/moe_fused_rdna4.cu:761-776`); a 6144 x 2048
+  instance is a template argument away. It takes IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, but not
+  IQ1_S or Q2_K (`:731-735`).
+- **The prompt budget.** A/B a smaller `MAYA_GLM_PREFILL_MB` on Windows: fewer experts displaced per prompt
+  (section 7.2, cost 2) against smaller chunks.
+
+#### H6. Smaller items for this machine
+
+- **The CPU lane.** Its 16 threads spin beside an integrated GPU that shares their memory bandwidth and power
+  budget, and no calibration runs on HIP. A/B `MAYA_GLM_CPU_LANE=0` and half the threads by hand (runbook 9.8). On
+  Linux, with every expert resident, the lane has nothing to do anyway.
+- **Kernels.** Not where this machine's time is: its GEMVs already run at the memory's speed. For the record
+  **[code]**: the tuned AMD GEMV takes Q6_K and BF16 only (`src/kernels/cuda/glm_fast.cu:5558-5575`), so UD-IQ2_M's
+  Q5_K and Q8_0 weights go through the generic kernel; the indexer's scorer is the F32 one at every context (G3);
+  the tuned expert kernels need 4096-wide experts and gave 1.04 - 1.13x where they apply
+  (`docs/AMD_EXPERT_KERNELS.md:121-128`).
+- **Loading.** `MAYA_GLM_WARM_SEQ=0` on the NVMe (D5).
+- **Turbo here** starts with fewer experts a token (`MAYA_GLM_RESIDENT_TOPK`): at 4 of 8 it is 2.4 GB fewer bytes a
+  token, about 12% - if answers stay coherent that low on a quant this small (section 5.7).
+
+### 7.5 For the GGUF's author: tensor types and what the engine does with them
+
+The 170 GB target leaves about 8 MB an expert - 1.7 bits a weight - so the choice is between IQ1_S (7.4 MB), IQ1_M
+(8.3 MB) and IQ2_XXS (9.7 MB). The engine does not treat them alike. **[code]**
+
+| Expert type | Decode on the GPU | Decode on the CPU lane (one token) | Prompt path |
+| --- | --- | --- | --- |
+| IQ1_S | yes | ggml's dot; the 4-row kernel if `MAYA_GLM_LANE_ROW4=1` | batched (MMQ), and the light kernels for experts with few rows |
+| **IQ1_M** | yes | the engine's own AVX2 rows | **none: the whole prompt is read token by token** (`src/prefill/moe_mmq.cu:97-108`, `src/core/glm_prefill.cu:1102-1116`) |
+| IQ2_XXS | yes | the engine's own AVX-512 rows (this CPU has them) | batched (MMQ) and the light kernels |
+| IQ2_XS, IQ2_S, IQ3_XXS | yes | own AVX2 rows (IQ2_S: ggml's dot) | batched (MMQ); light kernels for IQ3_XXS only |
+| Q2_K | yes | ggml's dot | batched (MMQ), no light kernel |
+
+Sources: `src/kernels/cuda/glm_fast.cu:6941-6942`; `src/kernels/cpu/iq_avx2.cpp:802-821`,
+`iq_avx512_one.cpp:152-155`, `glm_lane_row4_avx2.cpp:590-604`; `glm_prefill.cu:2964`.
+
+**The one hard rule: no IQ1_M experts** - unless the fused AMD kernel is first opened to this shape and the prompt
+path's type check accepts it (H5). A mix of IQ1_S and IQ2_XXS reaches the same size: 57 layers of IQ1_S and 18 of
+IQ2_XXS average 7.9 MB an expert.
+
+**Dense weights.** They are three quarters of a token's bytes on this machine: **each GB of dense weights costs
+about 4.3 ms a token [estimate]**.
+
+| Tensor | Guidance |
+| --- | --- |
+| `attn_k_b`, `attn_v_b` | Q8_0, served natively once M3 is on. Any type the kernels cannot read is widened to BF16 (`tools/strata/glm_dsa_pack.py:128-161`), which doubles it |
+| `attn_output`, `attn_q_a`, shared expert, dense FFN | Q4_K or Q6_K rather than Q5_K where the size allows: both have the tiled multi-column GEMV the verify window uses, Q5_K does not (G4); Q6_K also has the tuned AMD GEMV |
+| `attn_q_b` | Q8_0 today (2.8 GB a token). Q6_K is 2.1 GB, Q5_K 1.8 GB |
+| indexer tensors, router | float (BF16 / F32) only: the prompt path refuses anything else (`src/core/glm_prefill_dsa.cu:94-108`) |
+| the head, token embedding | any K-quant; the embedding stays on the host |
+
+## 8. Suggested order of work
+
+The order follows the owner's decisions: the targets are PCs that run the model from VRAM + RAM (+ NVMe) and the
+Gorgon Halo; the exact mode first, then Turbo; rigs that hold the model in VRAM last.
+
+### 8.1 Step 1: measure and flip (no new code)
+
+Everything here is a setting or a data file. Section 9 gives each row its procedure and its pass rule, and the model
+that carries this report out decides from the result.
+
+| # | Do | For | Runbook | See |
+| ---: | --- | --- | --- | --- |
+| 1 | Take the baseline: speeds, the engine's own lines, a decode profile, the quality references | every PC | 9.2 | section 3 |
+| 2 | Cache streaming: validate it, then set the product flag | RAM- and disk-bound PCs from 64K contexts; long prompts on one card. Not the Halo | 9.3 | M1 |
+| 3 | `attn_k_b` / `attn_v_b` in native Q8_0: parity run, pack rebuild | every PC, the Halo most | 9.3 | M3 |
+| 4 | FP16 index keys | every PC | 9.3 | M2 |
+| 5 | Decode graphs | every PC | 9.3 | G1 |
+| 6 | Rebuild the expert profile from decode counts | every PC | 9.4 | T1 |
+| 7 | Tier settings: RAM-resident with `PROMOTE_MIN`; on a disk-bound PC `VRAM_EVICT=least`, `RAM_FREE`, the usage file | RAM- and disk-bound | 9.4 | T3, D1, D2 |
+| 8 | CPU lane: time each expert type; the 4-row kernel; one shared pool on two GPUs | RAM-bound | 9.4 | C1, C4 |
+| 9 | Drafting on a split: acceptance, drafting off, speculative sampling | splits | 9.4 | S2, S3 |
+| 10 | Disk: read size, lookahead, the parallel load order, the prompt's readers | disk-bound | 9.4, 9.5 | D3 - D5 |
+| 11 | Prompts: pipelined short reads on a split, the warm prompt, the CPU gate, the short-turn threshold | every PC | 9.5 | P1, P6 |
+| 12 | Turbo: sweep the existing switches against the coherence gate | every PC | 9.6 | A1, A3 |
+| 13 | The Gorgon Halo: Linux against Windows, one-GPU drafting, the hipBLASLt table, the sub-batch, the CPU lane | the Halo | 9.8 | H1 - H6 |
+
+### 8.2 Step 2: small, exact code changes
+
+Days each. None changes the model's output. In the order that serves the targets:
+
+1. **The tiers: T2, D1, T5 with D2.** Free the unused spare slots; let an evicted VRAM expert take the RAM tier's
+   coldest slot instead of going to disk; count usage in tokens so a prompt does not wipe it.
+2. **The CPU lane: C1, C2, C3.** The kernel per expert type by timing; huge pages on one-socket PCs; calibration
+   per expert class.
+3. **Prompt memory: P2.** The residual and hand-over buffers at GLM-5.3's real size - a quarter of today's.
+4. **Starting CPU work earlier: P3, P4, D4.** The prompt's CPU share from the plan on; the routes before the
+   shared expert; the CPU lane beside a route's disk reads.
+5. **Drafting: S1.** The six unwired pieces, the statistics first (every later decision needs the acceptance).
+6. **Launches: T4 steps 2 and 3, H4.** The missing graph-key field; the fused wait + fetch and the per-layer skip
+   on the token path.
+7. **The verify window: G4, S5.** The tiled multi-column GEMV for Q5_K; the headwise GEMVs once a window. This is
+   the Gorgon Halo's main decode item.
+8. **Prompt attention glue: K2, K3, K6.**
+9. **Reuse: R1, R2.**
+10. **Disk: D3, D5.** An expert read in one piece; the load order by disk type; a message when direct IO is
+    refused.
+11. **The Gorgon Halo: H1, H5.** A setup warning for a large carve-out on Linux; the fused AMD expert kernel at
+    6144 x 2048 (the largest of these, a few days to a week).
+
+### 8.3 Step 3: Turbo's new code
+
+Speed first; coherence is the only gate (section 5.7).
+
+1. **A2, item 1:** the route bias and the miss skip in the prompt path - the largest prompt lever on a RAM-bound
+   PC.
+2. **A2, item 2:** a per-layer map for `RESIDENT_TOPK`.
+3. **A2, item 3:** lenient draft acceptance on a split.
+4. **G1, G2:** in Turbo a RAM-bound PC no longer waits for experts, so the GPU path sets its speed - graphs and
+   the attention kernels move up.
+5. **A2, items 4 - 6:** the deferred CPU add, the smaller dense quant at load, fewer attended cells.
+6. **The product side:** offer Turbo for GLM-5.3 with the values the sweep chose (section 9.6).
+
+### 8.4 Step 4: the larger pieces
 
 | Piece | Why it is worth the effort | See |
 | --- | --- | --- |
-| One `mma.sync` attention kernel at GLM-5.3's row width, used by decode and prompt (Ampere and newer); its Turing and RDNA counterparts | the attention is 11 G multiply-adds a token and about 30% of a compute-bound prompt | G2, K1 |
-| A GLM-5.3 Turbo preset, and the deferred CPU add | on a RAM-bound PC the largest single lever; needs a KL sweep of 75 layers | A1, A2 |
-| A cheap verify window, then the pipelined window on 3+ GPUs, then batched `--parallel` rows | the only way to read the dense 15 GB once for several tokens | S5, S6, S7 |
+| One `mma.sync` attention kernel at GLM-5.3's row width for decode and prompt (Ampere and newer), and its Turing counterpart | about 30% of a long prompt read; the attention of every Turbo token | G2, K1 |
+| One expert pass a prompt instead of one a chunk | 10 s a chunk on one V100; on a disk-bound PC also one disk read of each expert a prompt | P5 |
 | The split planned for the speculative decode | up to about 18% on three equal cards | S4 |
-| Expert kernels measured and shaped at 6144, AMD's included | a third of a token's bytes | T7, K5 |
+| Expert kernels measured and shaped at 6144 | a third of a token's bytes | T7, K5 |
 | The indexer's scorer at mid and long context | grows with the context; all of AMD | G3, K4 |
-| One expert pass a prompt on one GPU | 10 s a chunk on a V100 | P5 |
-| A smaller dense quant at load | 1 - 2 GB a token; changes the answers | M4 |
+| A smaller dense quant at load, as a normal-mode option | 1 - 2 GB a token | M4 |
 
-### 7.4 By kind of PC
+### 8.5 Deferred: rigs that hold the model in VRAM
+
+Not a target at this stage: the pipelined window on three or more GPUs (S6; its safety fix is not deferred),
+batched `--parallel` rows (S7), and the all-resident launch skip on NVIDIA (T4, step 1).
+
+### 8.6 By kind of PC
 
 | PC | A token mostly waits on | Start with |
 | --- | --- | --- |
-| **RAM-bound** (the usual one) | the CPU lane and PCIe | M1 - M3 and T1 - T3 (more experts in VRAM), C1 - C3 (a faster lane), S3 (check that drafting pays), then A1. Prompts: P1 or P2, P3 |
-| **VRAM-rich** | the GPUs' memory bandwidth and launch overhead | G1, G2, T4, then G4 + S5 -> S6. Prompts: K1 - K3 |
-| **Disk-bound** | the SSD | M1 - M3 first (every GB freed is a GB not read from disk), then `MAYA_GLM_DISK_SKIP_W` (A1) and `MAYA_GLM_DISK_READERS` for prompts (`docs/SETTINGS.md:151`: +50% on one SSD, -15% on another - measure) |
-| **AMD** | generic kernels | G2 step 1, G3 step 3, T7, K5 |
+| **RAM-bound** | the CPU lane and PCIe | M1 - M3 and T1 - T3 (more experts in VRAM), C1 - C3 (a faster lane), S3 (check that drafting pays). Prompts: P1 on a split, P2 on one GPU, P3. Then Turbo (9.6) |
+| **Disk-bound** | the NVMe | The same memory items first - every GB freed is a GB not read from disk - then D1 - D4. Turbo's route bias removes the disk from a token altogether |
+| **Gorgon Halo** | the memory's bandwidth | H1 (Linux, or a tighter fit on Windows), H2 (one-GPU drafting), M3 and the GGUF's dense types (7.5), H5 for prompts |
+| **Holds the model in VRAM** | *deferred* | G1, G2, T4 |
 
-## 8. How to measure
+## 9. Validation runbook (for the model that carries this report out)
 
-### 8.1 Ground rules
+**Who this is for.** You are the model that runs this on a real PC with the GPUs and the model present. Nothing in
+this report was measured. For each item: run the steps, compare with the pass rule, apply the decision that follows,
+write the result down. The owner's instruction is that you decide from the results; you do not need to ask before
+switching on something that passed its rule.
 
-- **Decode and prompt separately**, same quant, same context length, same thinking level. The bench and the
-  calibration both run with thinking off.
-- **Three runs.** `bench_http.py` flags a spread above 5%.
-- **"Same answers" means greedy token identity with the CPU lane off** (`STRATA_GLM_CPU_LANE=0`,
-  `STRATA_GLM_PREFILL_CPU=0`). The project's own A/B found that with the lane on "even base vs base differs"
-  (`tools/strata/glm53_gpu_checks.sh:20-23`), because the lane's plan comes from timings taken at load.
-- **Anything that may change answers** gets the KL check and the long-context gate (below), not just a speed number.
-- **Cold prompt numbers** need `STRATA_GLM_NO_REUSE=1` (`tools/strata/bench_http.py:17`).
-- **Drafting A/Bs on a split** need `MAYA_GLM_NO_SPEC=1` and a restart until S1 is fixed; the per-request
-  `"spec": 1` is ignored there. `MAYA_GLM_SPEC_FOLLOW` makes two runs decode the same text
-  (`src/program/generate.cpp:2224-2228`).
+Every command below was read from the repository's own tools and sources, but **none was run for this report**. If
+one fails as written, fix the command, not the rule.
 
-### 8.2 Tools already in the repository
+### 9.1 Rules, and the traps in the repository's own tools
 
-| Question | Tool |
+**Rules.**
+
+1. **One change at a time**, against a baseline taken the same day on the same PC, pack, context and thinking
+   setting.
+2. **Speed** is the median of three runs after one warm-up. A change is "faster" when its median is at least 3%
+   better and the two ranges do not overlap. Anything less is "no change": leave the default alone.
+3. **Every item has a class**, and the class decides its quality check:
+   - **E (exact)**: the same greedy tokens as the baseline (9.2, run 3).
+   - **R (rounding)**: tokens may differ; the KL against the baseline's own dump stays under the item's bound
+     (9.2, run 4), and the loop test finds no looping answer (9.2, run 5).
+   - **L (lossy)**: Turbo only; the coherence gate of 9.6.
+4. **A start loads the model** (minutes). Prefer per-request knobs (`--tune`) where a setting has one.
+5. **Write everything down** (9.9), including failures and commands that did not work.
+
+**Traps.** All **[code]**.
+
+| Trap | What to do |
 | --- | --- |
-| Decode and prompt tokens/s, end to end | `tools/strata/bench_http.py --corpus data/glm-dsa/bench-corpus --ctx 4096,32768 --prompt-lens 8192,32768 --runs 3`; `--tune '{...}'` sets per-request knobs without a restart |
-| Where a token's GPU time goes | `STRATA_GLM_PROF=1` (a mark after each kernel; graphs are off while it is on) |
-| The CPU lane | `STRATA_GLM_LANE_PROF=1`; `glm_cpu_bench <pack> <layer> --row4 both` for one expert type |
-| Drafting | `STRATA_GLM_SPEC_PROF=1`; `MAYA_GLM_SPEC_LOG` once S1 feeds it |
-| A prompt's stages | `MAYA_GLM_PREFILL_STAGES` (one line a chunk and part), `STRATA_GLM_PREFILL_PROF`, `STRATA_GLM_PREFILL_TRACE=1` |
-| Decode kernels alone | `glmd_dec_bench` (`tests/glm_dsa/glmd_dec_bench.cu`) |
-| Prompt kernels alone | `glmd_batch_parity` with `GLMD_BATCH_BENCH=1` |
-| Tier policies | `STRATA_GLM_ROUTE_LOG` and `tools/glm_tier_replay.py`; the slots-per-layer line under `STRATA_GLM_TIMING` |
-| A split's price | `STRATA_GLM_SPLIT_LOG=1`; `STRATA_GLM_SPLIT_CARDS` prices cards the PC does not have |
-| The worst case for the tiers | `STRATA_GLM_RANDOM_ROUTING` |
-| Output quality | `tools/strata/glm53_gpu_checks.sh kld` and `long`; `tools/strata/glm53_long_gate.py` |
+| The setup builds no tests (`-DSTRATA_BUILD_TESTS=OFF`, `maya.py:2056-2072`) | Configure them on once (9.2) |
+| Test binaries and `glm_cpu_bench` read only `STRATA_*` names. The engine (`maya`) and the server also take `MAYA_*` (`include/strata/platform/env_alias.hpp:19-40`) | Use the `STRATA_` spelling with test binaries |
+| `data/glm-dsa/parity/` ships no token files, so `glm53_gpu_checks.sh kld` and `flash-ab` do nothing unless `--ab-tokens FILE` is given | Make token files (9.2) |
+| `glm53_gpu_checks.sh kld` and `loop` print PASS whenever the engine exits 0; `loop_test.py` always exits 0 | Read the numbers yourself: the KL, and "loop test: N looping answer(s)" |
+| `glm53_gpu_checks.sh` refuses to run while port 8080 serves; its `long` check uses GPUs 0,1,2 | Stop the server first; call `glm53_long_gate.py` with `--gpus` on other PCs |
+| A `--setup` run rebuilds the config's `env` (hand-added entries are lost) and writes `--kv-streaming off` again for GLM-5.3 (`maya.py:3495-3497`, `:3513-3559`) | Test with a copy of the config, or pass settings to the setup as `--env MAYA_X=v` |
+| `STRATA_GLM_PROF` keeps the decode graphs off | Never profile and time graphs in one run |
+| Request knobs: `"graphs"` can only switch graphs *off*; `"spec": 1` does not reach a split's decode; `"vram_evict"` does nothing | Use the environment and a restart for these |
+| With the CPU lane on, two runs of one build can give different tokens (its plan follows timings taken at load, `tools/strata/glm53_gpu_checks.sh:20-23`) | Exactness runs switch the lane off (9.2, run 3) |
 
-### 8.3 Numbers the repository does not have yet
+### 9.2 Preparation and baseline
 
-A first measuring session should produce these. They replace this report's estimates and decide its order.
+**Build, and the tests.**
 
-1. A per-kernel decode profile of GLM-5.3 on one VRAM-rich and one RAM-bound PC (replaces section 3).
-2. Draft acceptance at temperature 1.0, top-p 0.95 (S2 - S4 depend on it; the code assumes 0.8).
-3. The CPU lane's speed per expert type, for ggml's dot, the engine's own rows and the 4-row kernel (C1).
-4. An expert kernel's time at 6144 x 2048 on each GPU architecture (T7).
-5. A prompt's time split inside the attention phase: projections, scores, top-k, attention, output (K1 - K4).
-6. `MAYA_GLM_PREFILL_MIN_CHUNKS` on a GLM-5.3 split (P1), and the split's chunk cap.
-7. The length of the common prefix between consecutive requests of real agent sessions (R1).
+```sh
+./maya.sh --setup --gguf-dir <folder with every GGUF shard>   # builds build/maya and the pack. Windows: START-MAYA.bat. AMD: add --backend hip --gpu 0
+.venv/bin/cmake -S . -B build -DSTRATA_BUILD_TESTS=ON          # AMD: -B build-hip
+.venv/bin/cmake --build build -j 4
+STRATA_PYTHON=$PWD/.venv/bin/python ctest --test-dir build -L gpu -j 1 --output-on-failure --timeout 3600
+```
+
+Every test must pass or be skipped. The fixture tests build a synthetic model themselves and need numpy and
+gguf-py in that Python.
+
+**Names used below.**
+
+```sh
+EXE=build/maya                            # AMD: build-hip/maya
+CFG=maya-glm-5.3-<quant>.json             # AMD: maya-glm-5.3-<quant>-hip.json. "args": the engine's arguments; "env": its settings; "log": its stderr
+PACK=<the --glm-pack path in $CFG>
+ARGS="--glm-pack $PACK --max-context 32768 --expert-cache auto --prefill auto --kv-streaming off --expert-profile <as in $CFG>"
+GPUS="CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<the config's gpu list>"   # AMD: HIP_VISIBLE_DEVICES
+X="STRATA_GLM_CPU_LANE=0 STRATA_GLM_PREFILL_CPU=0 STRATA_GLM_MTP_ADAPT=0 STRATA_GLM_USAGE=0"   # for exactness runs only
+```
+
+**Token files.** The engine binary has no tokenizer. A chat prompt with thinking off is
+`[gMASK]<sop><|user|>\n<the question><|assistant|>\n</think>` (`maya.py:4841`). Make three files: about 1K, 8K and
+30K tokens (a question about a cut of `data/glm-dsa/bench-corpus/prompt_32k.txt` does).
+
+```sh
+.venv/bin/python -c "import sys; sys.path.insert(0,'tools'); import strata_tokenizer as ST; \
+print(','.join(map(str, ST.Tokenizer.from_dir('$PACK/tokenizer').encode(open('prompt.txt').read(), parse_special=True))))" > ids.txt
+```
+
+**The six kinds of run.**
+
+1. **Speed through the server** (what a user sees). `bench_http.py` needs `--api openai`; it sends one user message,
+   temperature 0, thinking off. Put `MAYA_GLM_NO_REUSE=1` in the config's `env` for cold prompt numbers.
+
+   ```sh
+   ./maya.sh --config $CFG --plain &         # ready when: curl -s http://127.0.0.1:8080/health
+   .venv/bin/python tools/strata/bench_http.py --api openai --port 8080 --corpus data/glm-dsa/bench-corpus \
+       --tokenizer $PACK/tokenizer --ctx 4096,32768 --prompt-lens 2048,8192,32768 --gen 256 --runs 3 --json base.json
+   # a per-request setting, no restart:  --tune '{"lane_row4": true}'
+   ```
+
+   The corpus reaches about 52K tokens; a longer context needs a longer one (`tools/strata/make_bench_corpus.py`).
+
+2. **One engine run without the server** (for settings that need a start).
+
+   ```sh
+   env $GPUS STRATA_GLM_USAGE=0 <settings> $EXE $ARGS --tokens-file ids.txt --greedy --max-new 256 > run.out 2> run.log
+   # sampling as the model's default:  --seed 1 --temperature 1.0 --top-p 0.95   instead of --greedy
+   ```
+
+   Read the last line of `run.out`:
+   `DONE <produced> <prompt tokens> <prompt ms> <decode ms> <finish> <drafts accepted> <offered> <reused> <vram hits> <lookups>`
+   (`src/program/generate.cpp:2476`), and in `run.log` the line
+   `glm stat: decode .. ms/tok | vram hit ..% | ram fetches ../tok | disk .. reads/tok .. | promotions ../tok | cpu lane ../tok .. | prompt .. ms/tok`
+   (`:2487`). One GPU only: add `STRATA_GLM_SPLIT=0`.
+
+3. **Token identity** (class E). The baseline twice, then the change:
+
+   ```sh
+   env $GPUS $X           $EXE $ARGS --tokens-file ids.txt --greedy --max-new 256 > a1.out
+   env $GPUS $X           $EXE $ARGS --tokens-file ids.txt --greedy --max-new 256 > a2.out
+   env $GPUS $X <setting> $EXE $ARGS --tokens-file ids.txt --greedy --max-new 256 > b.out
+   diff <(grep '^T ' a1.out) <(grep '^T ' a2.out) && diff <(grep '^T ' a1.out) <(grep '^T ' b.out) && echo IDENTICAL
+   ```
+
+   If the baseline differs from itself, say so in the results and use run 4 instead.
+
+4. **KL against the baseline** (class R). `STRATA_GLM_SCORE=<c>` scores the tokens after the first c
+   (`generate.cpp:4060-4067`); use a file of c + 256 tokens (a dump is 620 KB a scored token).
+
+   ```sh
+   env $GPUS $X STRATA_GLM_SCORE=<c> STRATA_GLM_SCORE_PREFILL=1 STRATA_GLM_SCORE_DUMP=base.f32 $EXE $ARGS --tokens-file ids.txt
+   env $GPUS $X STRATA_GLM_SCORE=<c> STRATA_GLM_SCORE_PREFILL=1 STRATA_GLM_SCORE_REF=base.f32 <setting> $EXE $ARGS --tokens-file ids.txt
+   ```
+
+   Read `SCORE n tokens: nll .. ppl .. top1 ..% | vs ref: KL x (max y), same top token z%`. Run the baseline against
+   its own dump once: that KL is the noise floor (0 with the lane off; the lane alone moved Flash by about 0.06,
+   `docs/SETTINGS.md:134`).
+
+5. **The loop test** (coherence; `tools/maya_quant/loop_test.py`). Five prompts that need long, structured answers
+   (a three.js scene, a canvas animation, an explanation, a plan in Portuguese, a proof), each once sampled and once
+   greedy, checked for: stopped by itself, closed its reasoning, no 32-token window repeated three times, under 15%
+   of its tokens inside repeated 64-grams.
+
+   ```sh
+   .venv/bin/pip install tokenizers
+   env $GPUS <settings> .venv/bin/python tools/maya_quant/loop_test.py --exe $EXE --pack $PACK --tok $PACK/tokenizer \
+       --max-new 3000 --runs 1 --save out/loop-<name>
+   ```
+
+   Pass: the last line is `loop test: 0 looping answer(s)`. A `CAP` row (still writing at the limit, no repeat) is
+   acceptable; a `BAD` row is not. `--save` keeps every answer as text.
+
+6. **The long-context gate.** No token file ships: make one from a chat prompt over a 16K - 32K-token document.
+
+   ```sh
+   .venv/bin/python tools/strata/glm53_long_gate.py --exe $EXE --pack $PACK --tokens long.ids --head 20 --tol 0.25 \
+       --gpus <list> [--env STRATA_X=v] --out out/long
+   ```
+
+   It prints `PASS|FAIL long gate: long NLL .. | short NLL .. | long - short ..`. **It fails at 32K today**
+   (section 3.4), so compare a change with the baseline's own "long - short", not with PASS.
+
+**The baseline to record, once per PC.**
+
+- The bench table of run 1: decode at 4K and 32K, prompt at 2K, 8K and 32K, cold.
+- From the engine's log at load: `glm fast: CUDA.. expert pool .. GB, a-b slots/layer`;
+  `glm prefill: .. chunks of T tokens`; `glm split auto: ..`;
+  `CPU lane: N threads, an expert X ms on the CPU vs Y ms over PCIe`; `glm-dsa mixer: .. decode policy: ..`.
+- Per request: the `glm stat:` line and `glm spec: a of b drafts accepted`.
+- A decode profile: run 2 with `STRATA_GLM_PROF=8` for 64 tokens prints, at exit, each kernel's ms a token.
+  `STRATA_GLM_TIMING=1` adds the slots per layer and the tier counters; `STRATA_GLM_LANE_PROF=1` the lane's phases.
+- A prompt profile: the stage line of each chunk (on by default) and `STRATA_GLM_PREFILL_PROF=1`.
+- Quality: the baseline's KL against itself, its loop test, its long-gate number.
+
+Then **name the PC's kind**, because it decides what to run: disk reads a token above zero after 200 tokens -
+disk-bound; else a VRAM hit rate under about 95% - RAM-bound; else GPU-bound (the Gorgon Halo, or any PC in Turbo).
+
+These numbers are also the ones section 3 could only estimate: the per-kernel decode profile, the draft acceptance,
+the lane's speed per expert type, the prompt's split inside the attention.
+
+### 9.3 Features that are built but switched off
+
+#### M1. Cache streaming - class E for the decode, R for a long prompt
+
+1. **There is no test of a streamed GLM-5.3 window.** The nearest is `glm_dsa_prefill_decode_test` with
+   `STRATA_GLM_KV_RESIDENT=2096 STRATA_GLM_KV_RESIDENT_TEST_MIN=2096` (context 4,096; a window between 2,048 and
+   2,135 makes it evict). Its logits and draft checks apply as they are; its cache-row checks read the arena in
+   position order and must first learn the residency map. Write that variant and add it to
+   `cmake/glm_dsa.d/55-glm-dsa-wire.cmake`. It must end `glm_dsa_prefill_decode_test: ok`.
+2. **Engine, same residents in both arms.** Cap the pool so that streaming does not change which experts fit:
+   `STRATA_GLM_POOL_GB=<a little under the resident arm's pool>` in both arms. With a 40K-token prompt and
+   `--max-context 65536`: arm A `--kv-streaming off`; arm B `--kv-streaming on --kv-resident 32768`. Run 3: the
+   tokens must be identical. The load prints
+   `glm pack: CUDA0 KV streaming: N of CTX positions of each of L DSA layers in VRAM (X GB), ..`, and each request
+   `glm kv: KV streaming: P% of N block reads hit VRAM ..` - the word `OVERFLOW` there is a failure.
+3. **Speed, without the cap.** Decode and prompt at a 100K context, streamed against resident: read tokens/s, the
+   slots per layer and the prompt chunk size. At 32K nothing may change (`--kv-streaming on` alone streams only when
+   the whole cache does not fit, `src/program/generate.cpp:4909-4939`).
+
+**Pass:** steps 1 and 2 hold, and at the long context the streamed arm is not slower in decode and has a larger
+prompt chunk. **Then:** `serve/glm_dsa_product.py:29` `KV_STREAMING = True`. Its consumers follow by themselves
+(`maya.py:1912`, `:3497`, `:3584`; `serve/models.py:263`, `:311-312`, `:556-563`; `serve/web/models.js:381`). Update
+`serve/test_glm_dsa_models.py:117-190` and `docs/GLM53.md:45`. Not on the Gorgon Halo (H3).
+
+#### M3. Native Q8_0 `attn_k_b` / `attn_v_b` - class R
+
+1. `PYTHONPATH=third_party/llama.cpp/gguf-py python3 -m unittest discover -s tools/strata -p 'test_glm_dsa_pack_native32.py' -v`,
+   and the ctest `glm_dsa_prefill_decode_test_native32`.
+2. Build a second pack beside the first:
+   `STRATA_PACK_NATIVE32=1 STRATA_GGUF_PY=third_party/llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py --gguf <first shard> --out <gguf folder>/pack-n32 --compat-bf16`.
+   Its `compat-bf16.json` must no longer list the two tensors, and the load must print
+   `W_kb/W_vb native Q8_0 on 79 layers`.
+3. Run 3 with `--max-new 64` and run 4, the new pack against the old.
+4. Run 2 on both packs for speed; `build/glmd_dec_bench 40` times the Q8_0 headwise GEMV on its own.
+
+**Pass** - the project's own bar (`tools/strata/glm_dsa_pack.py:115-125`): 64 greedy tokens identical, or KL under
+1e-4; and decode not slower. **Then:** make it the default at `glm_dsa_pack.py:124-125`, change the default the
+unit test asserts (`test_glm_dsa_pack_native32.py:25-32`), and rebuild installed packs with
+`MAYA_PACK_NATIVE32=1 ./maya.sh --setup --repack --gguf-dir <folder>`.
+
+#### M2. FP16 index keys - class R
+
+1. The ctest `glm_dsa_prefill_decode_test_fp16`.
+2. Run 4 with `STRATA_GLM_IDX_FP16=1` against the default at contexts of 4K, 16K and 30K (the selection only
+   matters above 2,048 keys). Run 6 both ways (`--env STRATA_GLM_IDX_FP16=1`). Run 5 once.
+
+**Pass:** KL at most 0.005 above the noise floor at every context; the long gate's "long - short" no more than 0.05
+nats worse; no looping answer. **Then:** the default at `src/core/glm_state_layout.cpp:239-241`. The product side
+assumes F32 keys and must follow: `serve/glm_dsa_product.py:43` (`KV_BYTES` 64352 -> 58720), `serve/models.py:326`,
+`maya.py:1951`; the test `tests/glm_dsa/glm_idx_fp16_test.cpp:72-74`; `docs/SETTINGS.md:2197`. Conversations saved
+under the old layout are refused and read again - expected.
+
+#### G1. Decode graphs - class E
+
+1. The ctests `glmd_graph_test`, `glmd_graph_gen_gpu_test`, `glm_dsa_prefill_decode_test_volta`.
+2. Run 3 with `STRATA_GLM_DSA_GRAPHS=1` at 1K, 8K and 30K tokens of prompt, on one GPU (`STRATA_GLM_SPLIT=0`) and
+   on the split. Then once more with the CPU lane on, as run 4.
+3. Speed: start the server with `MAYA_GLM_DSA_GRAPHS=1`; run the bench twice, plain and with
+   `--tune '{"graphs": false}'`.
+4. At unload the log prints `glm-dsa decode graphs: CUDA0 a captures, b replays, c invalidations, ..`: a handful of
+   captures, replays close to the token count.
+5. Before it becomes the default, close T4's step 2, or show it does not bite: after a graph is captured, send a
+   request with `"miss_skip_w": 0.2` and check that experts really are skipped.
+
+**Pass:** identical tokens everywhere, and decode at least 3% faster on some target PC with none slower.
+**Then:** the default at `src/kernels/cuda/glmd_graph.cu:27-32`.
+
+#### G2. The decode attention kernel - class R
+
+1. `build/glmd_dec_bench 40` on each GPU architecture prints the old and new attention times and
+   `mla_dec on this device: yes|no`. On a Radeon other than gfx1151: `STRATA_GLMD_MLA_DEC=1 build-hip/glmd_dec_bench`.
+2. NVIDIA: run 4 and run 2 with `STRATA_GLMD_FUSED_MLA=1`; the ctest `glmd_volta_parity`.
+
+**Pass:** KL at most 0.005 above the noise floor and the kernel faster in step 1 and in run 2. **Then:** the
+per-device rule in `src/kernels/cuda/glmd_dec.cu:270-279`, or the default at
+`include/strata/kernels/glmd_decode_policy.hpp:87`.
+
+### 9.4 Decode settings to sweep
+
+On NVIDIA run `./maya.sh --calibrate` first: it sets the CPU lane's share, its threads and the disk read size for
+this PC (it refuses a HIP build). Then, one row at a time:
+
+| Item | How | Read | Keep it when |
+| --- | --- | --- | --- |
+| **T1** the expert profile | Decode at least 5,000 varied tokens on the split, NextN loaded, with `MAYA_GLM_USAGE=<file>`. Then `.venv/bin/python tools/strata/glm_dsa_profile.py $PACK <file> --base data/expert-profile-glm53.bin --out $PACK/expert-profile.bin`, and set `--expert-profile` in the config by hand | Parse the new file as T1's table does: layers 77 and 78 must hold a normal share of the first 4,800 pairs. After a fresh start: VRAM hit %, decode | hit rate up, decode not slower |
+| **T3** RAM-resident tier | `--glm-ram-resident` in `args` (the start fails if RAM cannot hold every off-card expert - that is the test); then `--tune '{"promote_min": N}'` for N = 0, 2, 4, 6, 8 | decode, promotions a token | faster |
+| **D1, D2** disk-bound tiers | `MAYA_GLM_VRAM_EVICT=least`; `MAYA_GLM_RAM_FREE=32`; `MAYA_GLM_USAGE=<file>` across a restart | disk reads a token in `glm stat`; `STRATA_GLM_TIER_DIAG=1` | fewer reads and faster |
+| **C1** lane kernels | `build/glm_cpu_bench $PACK <layer> <threads> --row4 both`, one layer of each expert type (types: columns 2 and 3 of `$PACK/native_experts.txt`); then `--tune '{"lane_row4": true}'` | ms an expert, and "output bit-identical"; decode | faster for that type |
+| **C4** lane pool | two GPUs: `MAYA_GLM_CPU_SHARED=1`; `--tune '{"cpu_split": N}'` | decode, `STRATA_GLM_LANE_PROF=1` | faster |
+| **S2, S3** drafting on a split | three starts: default; `MAYA_GLM_NO_SPEC=1`; `MAYA_GLM_SPEC_SAMPLE=1`. Run 2 with the default sampling flags | `glm spec: a of b drafts accepted`, decode; `STRATA_GLM_SPEC_LOG=64` | the fastest of the three becomes this PC's setting |
+| **S1** non-Latin answers on 3+ GPUs | a Chinese prompt, default against `MAYA_GLM_MTP_DRAFT_VOCAB=0` | acceptance, decode | (confirms the gap; the fix is code) |
+| **D3** read size | `--tune '{"read_chunks": N}'` for N = 8, 4, 2, 1 | disk ms a token | faster |
+| **D4** lookahead | `MAYA_GLM_AHEAD=2` with `MAYA_GLM_AHEAD_READ=0`, then with reads | coverage and waste under `STRATA_GLM_TIMING=1`; decode | faster |
+| **D5** load order | `MAYA_GLM_WARM_SEQ=0` | `glm fast: .. tiers warm: N experts (X GB) in T s` | faster on this disk |
+
+To check a profile (T1): how many of each layer's experts are among the first 4,800 ranked pairs.
+
+```sh
+python3 - "$PACK/expert-profile.bin" <<'EOF'
+import struct, sys, collections
+b = open(sys.argv[1], 'rb').read()                      # "STRP", then version, layers, experts, slots, ranked pairs
+ver, nl, ne, want, nr = struct.unpack('<5I', b[4:24])
+raw = struct.unpack('<%dH' % (2 * nr), b[24:24 + 4 * nr])   # (layer, expert) pairs, best first
+top = collections.Counter(raw[2 * i] for i in range(min(nr, 4800)))
+for layer in range(nl): print(layer, top[layer])       # layers 0-2 have no experts; 3..78 should be alike
+EOF
+```
+
+### 9.5 Prompt settings to sweep
+
+All measured with run 1's prompt rows, cold. A change in chunking is class R: check run 4 with a long context, and
+accept a KL up to 0.02 (re-blocking alone measured 0.013 on Flash, `docs/SETTINGS.md:85`).
+
+| Item | How | Keep it when |
+| --- | --- | --- |
+| **P1** pipelined short reads (splits) | `MAYA_GLM_PREFILL_MIN_CHUNKS=3,2048`; also `2,2048` and `4,2048`; prompts of 2K, 4K, 8K, 16K | faster at 4K - 16K and not slower at 2K |
+| **P6** first prompt | `MAYA_GLM_WARM_PROMPT=64`; time the first request after a start | the first prompt is as fast as the second |
+| **P6** CPU gate | `MAYA_GLM_PREFILL_CPU_GATE=0`, then `1` | faster |
+| **P6** short turns | `MAYA_GLM_PREFILL_MIN` = 8, 16, 32, 64; time follow-up turns of 5, 20 and 50 new tokens on a restored conversation | the fastest becomes the default for this model |
+| **D5** disk readers | `MAYA_GLM_DISK_READERS=8`; `MAYA_GLM_DISK_QD` = 4, 8, 16 | faster on this disk |
+| **K5** Volta only | `MAYA_GLM_PREFILL_BLAS` = 0, 128, 512, each with `MAYA_PF_WMMA` = 0, 1 | the fastest pair |
+| **K1** Turing only | `STRATA_GLMD_GATHER_RATIO=1` | faster |
+
+For where the time goes: the stage line of each chunk, `STRATA_GLM_PREFILL_PROF=1`, `STRATA_GLM_PREFILL_TRACE=1`.
+
+### 9.6 Turbo: the sweep and the coherence gate
+
+**The rule (the owner's).** Turbo takes the fastest settings whose answers are still coherent. Less detailed or less
+accurate is acceptable; incoherent is not.
+
+**Every Turbo arm** runs greedy with thinking off or at its lowest level - the request half the page already
+applies (`serve/web/turbo-core.js:6-18`).
+
+**The sweep.** Take the exact mode's speeds and saved loop-test answers first; they are the reference.
+
+1. **Route affinity** (RAM- and disk-bound PCs; a restart for each value): `MAYA_GLM_ROUTE_AFFINITY` = 2, then 1,
+   0.5, 0.3, 0.2, 0.1, 0.05. Read decode tokens/s and the VRAM hit rate in `glm stat` (100% means no expert is
+   fetched any more). Keep the largest value that passes the gate.
+2. **Fewer experts a token**, on top of step 1: `MAYA_GLM_RESIDENT_TOPK` = 6, then 5, then 4. Stop at the first
+   that fails. Be warned: on Flash's 1 - 2 bit quants a cap of 4 "invented three.js classes and rambled"
+   (`serve/models.py:796-798`), and GLM-5.3's quants are in that range.
+3. **If the affinity had to stay low:** `--tune '{"miss_skip_w": w, "miss_skip_from": l}'` for w = 0.08 .. 0.20 and
+   l = 0, 23, 40 (no restart), and on a disk-bound PC `MAYA_GLM_DISK_SKIP_W` = 0.12, 0.20.
+4. **On a split:** `--tune '{"mtp_keep": 0}'`.
+
+On the Gorgon Halo start at step 2, then step 1 for the experts outside GPU memory.
+
+**The coherence gate.** A candidate passes only if all of these hold:
+
+1. Run 5 with the candidate's settings ends `loop test: 0 looping answer(s)`, with no `BAD` row.
+2. No request ends in `ERR`.
+3. The saved three.js and canvas answers contain a script that parses (`node --check` on the extracted script -
+   the check the project used for Flash's Turbo, `serve/models.py:784-787`), and no answer has broken characters.
+4. **You read every saved answer**, beside the exact mode's answer to the same prompt, and judge each: on the
+   topic, grammatical, consistent with itself, and finished. Fail the candidate if any answer drifts off the
+   topic, contradicts itself, turns into word salad, or stops making sense partway. Do **not** fail it for being
+   shorter, plainer or less accurate.
+5. One question about a 16K - 30K-token document whose answer is in the text: the reply must be about that
+   document.
+
+Record run 4's KL for each candidate, for information only.
+
+**Choose** the fastest candidate that passes; between two within 3%, the one with the lower KL.
+
+**Then wire it** (`serve/models.py`): GLM-5.3's config is in the `glm` family, so removing the gate alone would
+apply Flash's values. Add GLM-5.3's own entry and pick it in `turbo_patch` (`:825`) with
+`G53.config_is_glm_dsa(cfg)`; make `turbo_hidden` (`:837-840`) return false; decide whether Turbo's 32,768 context
+cap (`:770-771`) should apply (it frees VRAM for experts, which suits the route bias). Update `serve/test_turbo.py`
+and `serve/test_glm_dsa_models.py:201-221`, `docs/GLM53.md:60`, and document `MAYA_GLM_ROUTE_AFFINITY` in
+`docs/SETTINGS.md`. The request half needs nothing.
+
+**Prompts in Turbo** are not affected by any of these switches until A2's first item is written; measure them again
+after it.
+
+### 9.7 After a code change
+
+| Area | Run | Must hold |
+| --- | --- | --- |
+| Any engine change | the ctests (`-L gpu`); run 3 on a short and an 8K prompt, one GPU and the split; run 5 | tests pass; tokens identical (class E changes); no looping answer |
+| Tiers (T2, D1, T5, D2) | `glm_tier_plan_test`, `glm_heat_evict_test`; run 3; `glm stat` before and after; a route log (`STRATA_GLM_ROUTE_LOG=<prefix>`) through `tools/glm_tier_replay.py` | identical tokens; more hits or fewer disk reads |
+| CPU lane (C1 - C3) | `glm_cpu_bench .. --row4 both`; run 4 with the lane on | "output bit-identical"; KL at the noise floor |
+| Drafting (S1) | `glm_ngram_draft_test`, `glm_dsa_spec_test`, `glm_dsa_spec_rollback_test`, `glm_dsa_spec_gpu_test`; run 3 against `MAYA_GLM_NO_SPEC=1` | drafts never change a greedy token |
+| Verify window (G4, S5) | `glmd_mv_parity`; run 3 with `MAYA_GLM_MTP_DECODE=1` against the token path | identical tokens |
+| Prompt path (P2 - P4, K2, K3) | `glmd_batch_parity`, the `glm_dsa_prefill_decode_test` family; run 4 with a long context | KL at most 0.02 against before (0 for P2, which is exact) |
+| Reuse (R1, R2) | `STRATA_TEST_ENGINE=build/maya STRATA_TEST_PACK=$PACK .venv/bin/python -m unittest serve.test_engine_contract -v`; a three-turn conversation with and without `MAYA_GLM_NO_REUSE=1` | the same greedy answers |
+
+### 9.8 The Gorgon Halo
+
+1. **The pack's expert types.** `$PACK/native_experts.txt` (columns 2 and 3) must not hold type 29 (IQ1_M). The
+   log must not say `glm prefill: .. has no prompt path (not covered: ..) - token by token`.
+2. **The fit.** From the start log: `VRAM before the expert pool`, `expert pool .. GB, a-b slots/layer`; on Windows
+   `Windows gives this APU's GPU ..`, `the RAM tier .. GB instead of ..` and any `WARNING: .. GB of experts stay off
+   the GPU`; on Linux `unified memory: MemAvailable .., experts need .., pool budget ..`. From `glm stat`: the VRAM
+   hit rate, RAM fetches and disk reads a token. Compare with section 7.2.
+3. **H1, Linux against Windows.** The same pack and context on both: run 1. On Linux set the BIOS carve-out small
+   first. Record whether every expert is resident (hit rate 100%, no RAM fetches).
+4. **H2, one-GPU drafting.** `MAYA_GLM_MTP_DECODE=1` (a start). Exactness: run 3 against the token path
+   (`STRATA_GLM_MTP_ADAPT=0` is already in `$X`). Speed: run 1, and in the same run `--tune '{"spec": 1}'` for the
+   arm without drafting. Read `glm spec: a of b drafts accepted`; `STRATA_GLM_WIN_PROF=1` shows where a round's
+   time goes. **Keep it when** decode is at least 3% faster with identical tokens.
+5. **H3, a tighter fit on Windows.** The native-Q8_0 pack (9.3); `MAYA_GLM_IDX_FP16=1` (9.3); a start with
+   `--glm-ram-resident` (it fails if anything would be left on the NVMe); `MAYA_GLM_RESERVE_MB=2048` only while
+   watching prompt speed for the paging symptom of section 7.1 (a drop of more than half).
+6. **H5, prompts.** The log names every projection shape that misses the hipBLASLt table: build
+   `tools/hip/tune_hipblaslt.cpp`, tune those shapes for the installed version, add the table, measure with
+   `tools/hip/bench_prefill.py` and run 1. Then `MAYA_GLM_PREFILL_SUB=2048`, and `MAYA_GLM_PREFILL_MB` = 4096,
+   6144, 8192.
+7. **H6.** `MAYA_GLM_CPU_LANE=0` and `MAYA_GLM_CPU_LANE=8` against the default; `MAYA_GLM_WARM_SEQ=0`.
+8. **Turbo:** 9.6.
+
+### 9.9 What to write down
+
+One entry a result, in `docs/GLM53-SPEED-RESULTS.md` (new):
+
+```
+## <item id> <short name> - <date>
+PC:        <GPUs, VRAM each, RAM, NVMe, OS, driver>      kind: RAM-bound | disk-bound | Gorgon Halo
+Model:     <quant, pack path, native32 yes/no>           context: <n>   thinking: off | <level>
+Class:     E | R | L
+Commands:  <exactly as run, with the environment>
+Baseline:  <three numbers> median <m>
+Change:    <three numbers> median <m>   (<+x%>)
+Quality:   <identical tokens | KL x against noise y | loop test N | long gate d>
+Verdict:   ON (default changed at <file:line>, commit <hash>) | OFF (why) | NEEDS CODE (what)
+```
+
+Commit each default that changes on its own, with its numbers in the message.
 
 ## Appendix A. Reviewed and found sound
 
