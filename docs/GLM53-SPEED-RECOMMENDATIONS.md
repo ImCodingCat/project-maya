@@ -78,14 +78,18 @@ they cite. Every number is one of three kinds, and each is labelled:
 A recommendation's *expected effect* is therefore a reasoned estimate, never a promise. Section 8 says how to measure
 each one with the tools the repository already has.
 
-**Three kinds of PC.** Which recommendation matters depends on where a token's time goes, so the report keeps
-naming these:
+**Four kinds of PC.** Which recommendation matters depends on where a token's time goes, so the report keeps
+naming these. The first three are **the targets** (the owner's decision, section 1); the fourth is not optimised at
+this stage.
 
-- **VRAM-rich** - most routed experts sit in VRAM (multi-GPU rigs with roughly 200 GB of VRAM or more, or a
-  unified-memory machine that holds the model). The GPUs' own kernels and memory bandwidth set the pace.
-- **RAM-bound** - the usual GLM-5.3 PC today ("64+ GB of GPUs + 192 GB RAM", `docs/MEMORY.md:55`): most experts sit in
-  the pinned RAM tier, and a token waits on the CPU lane and the PCIe link.
-- **Disk-bound** - less than about 245 GB of VRAM and RAM together: part of every token comes from the SSD.
+- **RAM-bound** *(target)* - the usual GLM-5.3 PC today ("64+ GB of GPUs + 192 GB RAM", `docs/MEMORY.md:55`): most
+  experts sit in the pinned RAM tier, and a token waits on the CPU lane and the PCIe link.
+- **Disk-bound** *(target)* - VRAM and RAM together do not hold the model: part of every token comes from the NVMe.
+- **Unified memory** *(target)* - the Gorgon Halo with 160 GB of GPU memory and 32 GB of RAM, running a GGUF of
+  about 170 GB. Nearly every expert is in GPU memory, and a token is bound by the memory's bandwidth. Section 7.
+- **VRAM-rich** *(not a target now)* - several discrete GPUs that hold every expert. The items that serve only this
+  kind are marked "deferred". Most of what makes it fast (graphs, the attention kernels, the verify window) is
+  needed anyway: by the Gorgon Halo, and by Turbo, which turns a RAM-bound PC into a GPU-bound one (section 5.7).
 
 ## 3. Where the time goes
 
@@ -569,11 +573,15 @@ miss cost, so the change is its objective: the best `spec_price(...).step_ms` ov
 
 #### S5. Make a verify window cheap on GLM-5.3 (the prerequisite for any multi-token pass)
 
-The window code runs on GLM-5.3, but row by row where it could share. **[code]**
+A verify window is the one mechanism that reads the 15 GB of dense weights once for several tokens. It is the
+**Gorgon Halo's main decode lever** (section 7), and the next step after Turbo on a RAM-bound PC. The window code
+runs on GLM-5.3, but row by row where it could share. **[code]**
 
-- **The dense weights are read twice a layer.** With the default stagger the rows go as two groups, each with its own
-  GEMV pass (`src/core/glm_residual.cu:259-273`), whether or not the CPU lane has anything to do - the stagger exists
-  to overlap the lane. Stagger only when a layer has lane work.
+- **On NVIDIA the dense weights are read twice a layer.** With the default stagger the rows go as two groups, each
+  with its own GEMV pass (`src/core/glm_residual.cu:259-273`), whether or not the CPU lane has anything to do - the
+  stagger exists to overlap the lane. Stagger only when a layer has lane work (`MAYA_GLM_WIN_STAGGER=0` turns it
+  off for an A/B). On AMD the batched window and its stagger are off by default (`glm_residual.cu:263`), so the
+  rows already go a layer at a time.
 - **`attn_k_b` / `attn_v_b` are read once per row.** `mixer_rows` batches the three GEMV groups but calls the
   attention row by row (`src/core/glm_dsa_mixer.hpp:421-507`), and `mla2` runs both headwise products inside each call
   (`src/kernels/cuda/glmd_fast.cu:419-452`): 29 MB a layer and row at BF16. Flash's window reads them once
@@ -587,9 +595,13 @@ The window code runs on GLM-5.3, but row by row where it could share. **[code]**
 - **The NextN cache rows run a whole mixer** whose "attention output ... is not used"
   (`src/core/glm_mtp.cu:422-427`): only the projections and `dsa_prep` are needed there.
 
-**Expect.** Nothing by default (no default mode uses a window). It decides whether S6 and the one-GPU decode can pay.
+**Expect.** Nothing by default (no default mode uses a window on GLM-5.3). It decides whether the one-GPU drafting
+can pay - on the Gorgon Halo an estimated 1.4 - 1.7x (section 7) - and S6 after it.
 
 #### S6. A deeper pipeline for 3+ GPUs: make the pipelined window work on GLM-5.3
+
+*Deferred: it pays only where several GPUs hold the experts, which is not a target at this stage. The safety fix
+at the end of the evidence (refuse the switch on GLM-5.3) is not deferred.*
 
 **What.** `MAYA_GLM_SPEC_WIN=1` (`decode_spec_pipe`) is the mode that would use more than two GPUs at once: the NextN
 block drafts a short chain and every GPU works on a consecutive position (`src/core/glm_mtp.cu:817-828`).
@@ -611,6 +623,8 @@ whose experts are mostly resident: a chain's extra positions read their experts'
 **Effort.** Medium: the `glmres` hooks in `win_pipe_part`, skip flags in the `glmd` kernels, S5, then measurement.
 
 #### S7. Several requests at once
+
+*Deferred: total throughput for several users, not one answer's speed.*
 
 `--parallel` answers GLM-5.3 requests one token of one conversation at a time (`docs/GLM53.md:59-60`;
 `BATCHED_ROWS = False`, `serve/glm_dsa_product.py:30-31`; `glm_rows_ok` is false for glm-dsa,
@@ -803,6 +817,10 @@ room for all of it, keeping the RAM copy would make an eviction a table edit.
 
 #### T4. Skip the empty launches on a VRAM-rich NVIDIA PC, and fuse them elsewhere
 
+*Step 1 is deferred (it needs discrete GPUs that hold every expert). Steps 2 and 3 are not. On AMD - the Gorgon
+Halo - the skip is already on by default, but it only acts while every expert is in GPU memory, which a 170 GB
+model on 160 GB will not quite reach (section 7).*
+
 **Evidence [code].** Every MoE layer of every token launches `moe_wait` and `moe_fetch`, and `moe_cpu_wait` when a
 CPU lane exists - unless every expert is in VRAM *and* the skip is on (`glm_fast_path.cu:6282-6298`, `:6344-6348`).
 The skip is on by default on AMD only (`glm_memory.hpp:13-23`). Measured there: "an empty launch and its gap were
@@ -885,43 +903,85 @@ VRAM-rich token **[estimate]**.
 - **Undocumented switches** that shape GLM-5.3's tiers: `STRATA_GLM_RAM_EVICT`, `_RAM_PROTECT`, `_RAM_FREE`,
   `_TIER_GC`, `_AHEAD` / `_AHEAD_READ`. Document or remove them.
 
-### 5.6 Optional approximations (they change the answers)
+### 5.6 Turbo: the fastest GLM-5.3 that still answers coherently
 
-Everything above keeps the model's output (M2 and the tensor-core attention within rounding). The engine also has
-switches that trade a little quality for speed. They are worth a section because on a RAM-bound PC they are
-potentially the largest single lever - a token's time there is its missing experts - and because **none of them is
-calibrated for GLM-5.3**: "Turbo is not offered for it yet" (`docs/GLM53.md:60`), and every number in the settings
-page is GLM-5.3-Flash's.
+**The owner's decision (2026-11-09).** GLM-5.3 gets a Turbo mode. In Turbo, speed comes first: quality may drop, and
+the only thing that must hold is that answers stay **coherent**. KL against the exact model is recorded for
+information; it is not a gate. Section 9.6 has the sweep and the coherence check to run.
 
-#### A1. Measure GLM-5.3's layer sensitivity and ship a preset
+Turbo is hidden for this model today ("until its own values are measured on it", `serve/models.py:837-840`), and
+every number in the settings page is GLM-5.3-Flash's. What follows is what to measure and what to build.
 
-**What exists [code].** All of these act in the shared route kernel, so they already work on GLM-5.3
-(`src/core/glm_fast_path.cu:6206-6240`): `MAYA_GLM_TRUNK_KEEP_MAP` (per layer, leave out the experts missing from
-VRAM from route rank n on), `MAYA_GLM_MISS_SKIP_W` / `_FROM` (the same by weight), `MAYA_GLM_DISK_SKIP_W` / `_FROM`
-(skip an expert that would come from the SSD), `MAYA_GLM_RESIDENT_TOPK` (compute only the heaviest experts, wherever
-they sit).
+#### A1. The Turbo levers that already work on GLM-5.3
 
-**What they gave on Flash [project]** (`docs/SETTINGS.md:133-136`): a per-layer map, "Maya-M 20.0 -> 24.6 tok/s ...
-KL 0.018" and "Maya-L +25%" on an RTX 3090 + 3060; by weight, 27.4 -> 29.3 tok/s at KL 0.037; for experts on the
-SSD, "decode 13.3 -> 21.6 tokens/s at `_W=0.12`" at KL 0.12. The same page records that the early layers "notice a
-left-out expert far more" than the late ones (KL 0.040 for layers 3-7 against 0.002-0.003 for layers 30-44).
+All of these act in the route kernel that GLM-5.3 shares with Flash (`src/core/glm_fast_path.cu:6206-6240`,
+`src/kernels/cuda/glm_fast.cu:3921-3951`), so they work today. **[code]** for what they do, **[project]** for the
+Flash numbers, which are the only ones there are.
 
-**Do.** Run that band-by-band KL sweep on GLM-5.3's 75 MoE layers (`glm53_gpu_checks.sh kld` against the untrimmed
-model), publish a 78-digit map and a weight threshold with their KL, and offer them as GLM-5.3's Turbo. Because
-GLM-5.3's experts are a third of a token's bytes rather than most of them, expect a smaller percentage than Flash's
-on a VRAM-rich PC and a similar one on a RAM-bound PC **[estimate]**.
+| Switch | What it does | Measured on Flash | For which PC |
+| --- | --- | --- | --- |
+| **`MAYA_GLM_ROUTE_AFFINITY=<bonus>`** | Adds the bonus to the selection score of every expert that is in VRAM, so a route prefers experts it can reach for free (`glm_fast.cu:4002-4003`). Eight experts still run and their weights stay their own. | Nothing: undocumented, never measured | RAM- and disk-bound: **the big one** (below) |
+| `MAYA_GLM_MISS_SKIP_W`, `_FROM` | Leaves out an expert that is not in VRAM and carries less than this share of the route's weight, on layers from `_FROM` on. Also a per-request knob (`"strata_tune": {"miss_skip_w": ..}`) | 27.4 -> 30.9 tok/s at 0.16 (KL 0.075), `docs/SETTINGS.md:135` | RAM-bound |
+| `MAYA_GLM_TRUNK_KEEP`, `_MAP` | Leaves out experts missing from VRAM from route rank n on; `_MAP` is a digit per layer | +23% and +25% with a per-layer map (KL 0.018), `docs/SETTINGS.md:133` | RAM-bound |
+| `MAYA_GLM_DISK_SKIP_W`, `_FROM` | Never waits for the SSD for a light or low-ranked expert | 13.3 -> 21.6 tok/s at 0.12 (KL 0.12), `docs/SETTINGS.md:134` | Disk-bound |
+| `MAYA_GLM_RESIDENT_TOPK=<k>`, `MAYA_GLM_RESIDENT_SKIP_W` | Computes only the k heaviest routed experts, **wherever they sit**; the kept weights are renormalised (`glm_fast.cu:4206-4225`) | Strix Halo, all experts in VRAM: 33.2 -> 38.8 tok/s at k = 4; k = 3 broke the output; `_SKIP_W=0.20` "garbage", `docs/SETTINGS.md:136` | **Gorgon Halo**, and everything else |
+| `MAYA_GLM_MTP_KEEP=0` | The draft block never fetches a missing expert | default 2 (`glm_fast_path.cu:6134-6145`) | splits |
+| Greedy decoding, thinking off or at its lowest level | Request level: fewer tokens, and more drafts accepted | part of Flash's Turbo | all |
 
-#### A2. Two switches that do not reach GLM-5.3 yet
+**Why route affinity is the big one [estimate].** On a RAM-bound PC a token's time is its missing experts: about
+half of the 600 it routes go to the CPU lane or cross PCIe, and some come from the SSD. With a bonus larger than any
+score difference (scores are a probability plus the model's selection bias; 2 is above that), a layer's top 8 are
+taken from the experts in VRAM alone - and every layer holds at least 8 (the pool's floor,
+`src/core/glm_model.cu:1800-1801`). Then **no expert is fetched at all**: no CPU lane, no PCIe, no SSD. The token
+costs what it would on a PC that holds the whole model: roughly 40 - 50 ms on V100-class cards instead of 150 - 250.
+The price is that each layer chooses among the experts it holds - perhaps 40 of 256 on a 64 GB rig - instead of
+all of them. Smaller bonuses (0.05 - 0.3) only tip close calls; the sweep in section 9.6 finds the largest bonus
+that stays coherent.
 
-- **`MAYA_GLM_DEFER_CPU`** (a layer's CPU-lane experts added after the *next* layer's attention, so the lane overlaps
-  it; Flash: 13.0 -> 14.0 tok/s at KL 0.034-0.038, `docs/SETTINGS.md:137`) is read only in the mHC layer loop
-  (`src/core/glm_fast_path.cu:6376-6381`). GLM-5.3's loop always waits (`src/core/glm_residual.cu:151`). With a plain
-  residual the deferred add is one vector addition, so the port is small - and GLM-5.3 has an attention on every
-  layer to overlap with, where Flash has one on a quarter of them.
-- **`STRATA_GLM_ROUTE_AFFINITY`** adds a bonus to the selection score of experts that are in VRAM ("LOSSY, it
-  changes which experts run", `src/kernels/cuda/glm_fast.cu:3940-3941`, `:6654-6658`). It is undocumented and
-  unmeasured. For a model whose experts can never all be resident it deserves a KL-against-speed curve: unlike the
-  skips it still computes eight experts, it only prefers the ones that cost nothing to reach.
+Two things follow from it:
+- With a saturated bonus the resident set never changes (nothing is fetched, so nothing is promoted). Which experts
+  a layer holds is then decided by the expert profile alone - T1 (the profile fix) matters twice in Turbo.
+- The `maya serve: decode expert cache hit rate` line (`src/program/generate.cpp:8657`) shows when it has
+  saturated: 100% hits.
+
+#### A2. New code for Turbo, by expected value
+
+1. **Give the prompt path the same route bias and miss skip.** None of the switches above reach a prompt read
+   (the route kernels of `src/core/glm_prefill.cu` take none of them; the settings page says "prefill and the MTP
+   layer stay exact"). With the affinity bonus in the prompt's route, a chunk routes only into experts that are in
+   VRAM: nothing is staged, prestaged, sent to the CPU or read from the SSD. The fixed cost of a chunk - about 10 s
+   on one V100, section 6.1 - disappears, and so does most of the chunk's borrowed memory (no staging ring, no
+   landing ring). **This is the largest prefill lever there is on a RAM-bound PC [estimate]**, and it is small:
+   the bonus is one add per expert before the top-8 (`route_rows` in `src/kernels/cuda/glmd_batch.cu`), reading the
+   same residency table the decode's route reads.
+2. **A per-layer map for `RESIDENT_TOPK`**, as `TRUNK_KEEP_MAP` has. Flash's layers differ by 10 - 20x in how much
+   they notice a left-out expert (KL 0.040 for layers 3-7 against 0.002-0.003 for 30-44,
+   `docs/SETTINGS.md:133`), so a single k for all 75 layers wastes most of what the late layers could give.
+3. **Lenient draft acceptance on a split.** A draft is kept only when it equals the model's own pick. Keeping it
+   when the model gives it at least a set probability (or ranks it in its top few) raises acceptance, and each
+   avoided miss saves a whole pass of one group of GPUs (section 5.3). There is no such switch today
+   (`STRATA_GLM_SPEC_ACCEPT` only sets the acceptance the price model assumes, `src/core/glm_dsa_spec.cpp:76`).
+4. **The deferred CPU add on GLM-5.3's layer loop** (`MAYA_GLM_DEFER_CPU`): a layer's CPU-lane experts are added
+   after the next layer's attention, so the lane overlaps it. Flash: 13.0 -> 14.0 tok/s at KL 0.034 - 0.038
+   (`docs/SETTINGS.md:137`). It is read only in Flash's loop (`glm_fast_path.cu:6376-6381`); GLM-5.3's always waits
+   (`src/core/glm_residual.cu:151`). Only worth it where misses remain after A1.
+5. **A smaller dense quant at load** (M4): `attn_q_b` from Q8_0 to Q5_K or Q4_K, `attn_output` from Q5_K to Q4_K.
+   1 - 2 GB fewer bytes a token. It matters most where a token is bound by memory bandwidth alone: the Gorgon Halo.
+6. **Attend to fewer cells.** The attention reads 2,048 selected cells on every layer. A Turbo cap (1,024 or 512),
+   or the attention sink plus the most recent cells with no indexer at all, cuts the attention's arithmetic and, at
+   long context, the whole key scan. The second was tried outside the tree and scored *better* than the indexer on
+   an 8K test (`tools/strata/glm53_long_gate.py:18-21`: 2.45 against 3.35) - which is also the open quality
+   question of section 3.4. Settle that first; it may turn out to be the right default, not a Turbo trick.
+
+#### A3. What Turbo should look like for each target PC
+
+| PC | Start the sweep from | Then add |
+| --- | --- | --- |
+| VRAM + RAM (+ NVMe) | `MAYA_GLM_ROUTE_AFFINITY=2`, greedy, lowest thinking level, `MAYA_GLM_MTP_KEEP=0` | `MAYA_GLM_RESIDENT_TOPK` 6 -> 5 -> 4; if the bonus must come down for coherence: `MAYA_GLM_MISS_SKIP_W` and `MAYA_GLM_DISK_SKIP_W` for what still misses |
+| Gorgon Halo, most experts in VRAM | `MAYA_GLM_RESIDENT_TOPK=4` (Flash's value there), greedy, lowest thinking level | `MAYA_GLM_ROUTE_AFFINITY` for the experts that do not fit; A2.5 once it exists |
+
+Section 9.6 turns this into a sweep with a pass / fail rule, and says where the winning values go in
+`serve/models.py`.
 
 ## 6. Prefill recommendations
 
